@@ -51,21 +51,6 @@
 ;;; Decode switch
 ;;;
 
-(defvar mew-prog-mime-decode-switch
-  `((,mew-b64 "-d" "-b")
-    (,mew-qp  "-d" "-q")
-    (,mew-xg  "-d" "-g")
-    (,mew-xuu "-d" "-u")))
-
-(defvar mew-prog-mime-decode-text-switch
-  `((,mew-b64 "-d" "-b" "-t")
-    (,mew-qp  "-d" "-q")
-    (,mew-xg  "-d" "-g" "-t")
-    (,mew-xuu "-d" "-u")))
-
-(defun mew-prog-mime-decode-get-opt (cte switch)
-  (cdr (mew-assoc-case-equal cte switch 0)))
-
 (defvar mew-decode-multipart-encrypted-switch
   `((,mew-ct-pge mew-pgp-decrypt mew-pgp-ver mew-prog-pgp)))
 
@@ -526,45 +511,12 @@ Return a part syntax after moving the beginning of the content body."
 
 (defun mew-decode-mime-body (textp ct cte &optional charset)
   ;; ((point), (point-max)) (not point-min)
-  (let* ((linebasep (mew-ct-linebasep ct))
-	 (beg (point))
-	 opt file decoded switch)
+  (let ((linebasep (mew-ct-linebasep ct))
+        (beg (point)))
     (unless (or (null cte) (mew-cte-composite-p cte))
-      (when (mew-case-equal cte mew-b64)
-	(condition-case nil
-	    (setq decoded (base64-decode-region beg (point-max)))
-	  (error (setq decoded nil)))
-	(when (and decoded linebasep)
-	  (goto-char beg)
-	  (mew-crlf-to-lf)))
-      ;; base64-decode-region may fail if garbage exists.
-      (cond
-       (decoded
-	())
-       ((mew-which-exec mew-prog-mime-decode)
-	(setq switch (if linebasep
-			 mew-prog-mime-decode-text-switch
-		       mew-prog-mime-decode-switch))
-	(setq opt (mew-prog-mime-decode-get-opt cte switch))
-	(if (null opt)
-	    ;; Treated as Application/Octet-Stream.
-	    ;; Never reach here when decoding.
-	    (mew-decode-error (concat "Unknown CTE: " cte))
-	  (setq file (mew-make-temp-name))
-	  (mew-frwlet mew-cs-dummy (if linebasep
-				       mew-cs-text-for-write
-				     mew-cs-text-for-net)
-	    ;; Due to broken MUAs, we need to write CRLF.
-	    ;; NEVER use call-process-region for privacy reasons
-	    (write-region beg (point-max) file nil 'no-msg))
-	  (delete-region beg (point-max))
-	  (mew-piolet mew-cs-binary mew-cs-dummy
-	    ;; mew-prog-mime-decode converts CRLF to LF, so
-	    ;; read input as binary.
-	    (apply 'call-process mew-prog-mime-decode file '(t nil) nil opt))
-	  (mew-delete-file file)))
-       (t
-	(mew-decode-error (concat mew-prog-mime-decode " does not exist")))))
+      (condition-case err
+          (mew-mime-transfer-region beg (point-max) cte linebasep t)
+        (error (mew-decode-error (error-message-string err)))))
     ;; charset conversion
     (if (and textp (eq (mew-dinfo-get-decode-text) t)) ;; not 'no-cs-conv
 	(mew-decode-charset-conv charset beg))))

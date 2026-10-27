@@ -3208,9 +3208,6 @@ your public key as well as receivers\\=' one."
 ;;;
 
 (defvar mew-prog-mewl        "mewl")
-(defvar mew-prog-mime-encode "mewencode")
-(defvar mew-prog-mime-decode "mewencode")
-(defvar mew-prog-8bit        "mewencode")
 (defvar mew-prog-unshar      "unshar")
 (defvar mew-prog-tar         "tar")
 (defvar mew-prog-compress    "compress")

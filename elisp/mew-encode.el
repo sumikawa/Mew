@@ -8,18 +8,122 @@
 
 (require 'mew)
 
-(defvar mew-prog-mime-encode-switch
-  `((,mew-b64 "-b")
-    (,mew-qp  "-q")
-    (,mew-xg  "-g")))
+(require 'qp)
 
-(defvar mew-prog-mime-encode-text-switch
-  `((,mew-b64 "-b" "-t")
-    (,mew-qp  "-q")
-    (,mew-xg  "-g""-t")))
+(defun mew-mime-uu-decode-region (beg end)
+  "Decode uuencoded bytes between BEG and END, ignoring the supplied name."
+  (let ((data (buffer-substring-no-properties beg end)))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert data)
+      (goto-char (point-min))
+      (unless (re-search-forward "^begin [0-7]+ .*\\r?$" nil t)
+        (error "Missing uuencode begin line"))
+      (forward-line)
+      (let (chunks done)
+        (while (and (not done) (not (eobp)))
+          (let ((line (buffer-substring-no-properties
+                       (line-beginning-position) (line-end-position))))
+            (if (string-match-p "\\`end\\r?\\'" line)
+                (setq done t)
+              (when (> (length line) 0)
+                (let ((n (logand (- (aref line 0) 32) 63))
+                      (pos 1) bytes)
+                  (when (>= (length line) (+ 1 (* 4 (/ (+ n 2) 3))))
+                    (while (> n 0)
+                      (let ((v 0))
+                        (dotimes (i 4)
+                          (setq v (+ (ash v 6)
+                                     (logand (- (aref line (+ pos i)) 32) 63))))
+                        (dotimes (i (min n 3))
+                          (push (logand (ash v (- (* 8 (- 2 i)))) 255) bytes)))
+                      (setq pos (+ pos 4) n (- n 3)))
+                    (push (apply #'unibyte-string (nreverse bytes)) chunks))))))
+          (forward-line))
+        (unless done (error "Missing uuencode end line"))
+        (setq data (apply #'concat (nreverse chunks)))))
+    (delete-region beg end)
+    (goto-char beg)
+    (insert data)))
 
-(defun mew-prog-mime-encode-get-opt (cte switch)
-  (cdr (mew-assoc-case-equal cte switch 0)))
+(defun mew-mime-gzip-string (data)
+  "Return a gzip stream for DATA using uncompressed DEFLATE blocks.
+This legacy transfer encoding needs no external compressor."
+  (let ((crc #xffffffff) (pos 0) (len (length data)) chunks)
+    (dotimes (i len)
+      (setq crc (logxor crc (aref data i)))
+      (dotimes (_ 8)
+        (setq crc (logxor (ash crc -1)
+                          (if (= (logand crc 1) 1) #xedb88320 0)))))
+    (setq crc (logxor crc #xffffffff))
+    (while (or (= pos 0) (< pos len))
+      (let* ((n (min 65535 (- len pos)))
+             (inv (logxor n 65535)))
+        (push (concat (unibyte-string (if (= (+ pos n) len) 1 0)
+                                      (logand n 255) (ash n -8)
+                                      (logand inv 255) (ash inv -8))
+                      (substring data pos (+ pos n))) chunks)
+        (setq pos (+ pos n))
+        (when (= len 0) (setq pos 1))))
+    (concat (unibyte-string 31 139 8 0 0 0 0 0 0 255)
+            (apply #'concat (nreverse chunks))
+            (apply #'unibyte-string
+                   (append (mapcar (lambda (n) (logand (ash crc (- n)) 255))
+                                   '(0 8 16 24))
+                           (mapcar (lambda (n) (logand (ash len (- n)) 255))
+                                   '(0 8 16 24)))))))
+
+(defun mew-mime-transfer-region (beg end cte linebasep &optional decode)
+  "Transfer encode or DECODE bytes in BEG to END using CTE.
+Normalize decoded CRLF only for LINEBASEP content."
+  (let ((data (buffer-substring-no-properties beg end)))
+    ;; Work separately so malformed input never leaves a partially changed body.
+    (setq data
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (insert data)
+            (when (and linebasep (not decode)
+                       (not (mew-case-equal cte mew-qp)))
+              (goto-char (point-min))
+              (mew-lf-to-crlf))
+            (cond
+             ((mew-case-equal cte mew-qp)
+              (if decode
+                  (progn
+                    (goto-char (point-min))
+                    (while (search-forward "=\r\n" nil t)
+                      (replace-match "" t t))
+                    (quoted-printable-decode-region (point-min) (point-max)))
+                (quoted-printable-encode-region (point-min) (point-max) t)))
+             ((or (mew-case-equal cte mew-b64) (mew-case-equal cte mew-xg))
+              (if decode
+                  (progn
+                    ;; Like mewencode, tolerate non-alphabet garbage.
+                    (goto-char (point-min))
+                    (while (re-search-forward "[^A-Za-z0-9+/=]" nil t)
+                      (replace-match "" t t))
+                    (base64-decode-region (point-min) (point-max))
+                    (when (mew-case-equal cte mew-xg)
+                      (unless (and (fboundp 'zlib-decompress-region)
+                                   (zlib-decompress-region (point-min) (point-max)))
+                        (error "Cannot decompress x-gzip64 body"))))
+                (when (mew-case-equal cte mew-xg)
+                  (let ((gzip (mew-mime-gzip-string (buffer-string))))
+                    (erase-buffer)
+                    (insert gzip)))
+                (base64-encode-region (point-min) (point-max))
+                (goto-char (point-max))
+                (insert "\n")))
+             ((and decode (mew-case-equal cte mew-xuu))
+              (mew-mime-uu-decode-region (point-min) (point-max)))
+             (t (error "Unknown CTE: %s" cte)))
+            (when (and decode linebasep)
+              (goto-char (point-min))
+              (mew-crlf-to-lf))
+            (buffer-string)))
+    (delete-region beg end)
+    (goto-char beg)
+    (insert data)))
 
 (defvar mew-encode-multipart-encrypted-switch
   `((,mew-ct-pge mew-pgp-encrypt)))
@@ -547,8 +651,12 @@
       t)))
 
 (defun mew-encode-file-8bitp (file)
-  (if (and (mew-which-exec mew-prog-8bit) (file-readable-p file))
-      (eq (call-process mew-prog-8bit file nil nil "-8") 1)))
+  (when (file-readable-p file)
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert-file-contents-literally file)
+      (goto-char (point-min))
+      (not (null (re-search-forward "[\200-\377]" nil t))))))
 
 (defun mew-encode-limit-7bitp (privacy)
   ;; Only parts to be signed FIRST are limited to 7bit.
@@ -562,15 +670,6 @@
 
 (defvar mew-draft-keep-text-charset nil)
 
-(defun mew-encode-mime-body-check (ret beg)
-  "Complain unless the encoder exited with 0.
-RET is what call-process gave back, or nil if it could not be run at
-all.  Whatever the encoder printed sits between BEG and the end of the
-region and would go out as the message, so that is removed first."
-  (unless (eq ret 0)
-    (delete-region beg (point-max))
-    (mew-encode-error (concat mew-prog-mime-encode " failed"))))
-
 (defun mew-encode-mime-body (ctl cte file no-encoding)
   ;; If file is 't', target is buffered.
   ;; text should be buffered
@@ -581,11 +680,8 @@ region and would go out as the message, so that is removed first."
 	 (charset (if textp (mew-syntax-get-param ctl "charset")))
 	 (icharset (if textp (mew-syntax-get-param ctl "icharset")))
          (linebasep (or textp (mew-ct-linebasep ct)))
-         (switch (if linebasep
-                     mew-prog-mime-encode-text-switch
-                   mew-prog-mime-encode-switch))
          (beg (point))
-	 buffer cs opt last flowed delsp flowed-delsp)
+	 buffer cs last flowed delsp flowed-delsp)
     (if (and (stringp file)
 	     (setq buffer (get-file-buffer file))
 	     (buffer-modified-p buffer))
@@ -705,25 +801,11 @@ region and would go out as the message, so that is removed first."
       (base64-encode-region beg (point-max))
       (goto-char (point-max))
       (insert "\n"))
-     ((mew-which-exec mew-prog-mime-encode)
-      (setq opt (mew-prog-mime-encode-get-opt cte switch))
-      (if (null opt)
-	  (mew-encode-error (concat "Unknown CTE: " cte))
-	(when textp
-	  (setq file (mew-make-temp-name))
-	  (mew-frwlet mew-cs-dummy mew-cs-text-for-write
-	    ;; NEVER use call-process-region for privacy reasons
-	    (write-region beg (point-max) file nil 'no-msg))
-	  (delete-region beg (point-max)))
-	(let ((ret (condition-case nil
-		       (mew-piolet mew-cs-text-for-read mew-cs-dummy
-			 (apply 'call-process mew-prog-mime-encode file t nil opt))
-		     ;; a program which cannot be run at all
-		     (error nil))))
-	  (if textp (mew-delete-file file))
-	  (mew-encode-mime-body-check ret beg))))
      (t
-      (mew-encode-error (concat mew-prog-mime-encode " does not exist"))))
+      (unless textp
+        (mew-frwlet (if linebasep mew-cs-text-for-read mew-cs-binary) mew-cs-dummy
+          (mew-insert-file-contents file)))
+      (mew-mime-transfer-region beg (point-max) cte linebasep)))
     (list cte charset flowed delsp)))
 
 (defun mew-encode-no-mime-encoding (privacy)
@@ -1153,38 +1235,7 @@ region and would go out as the message, so that is removed first."
 ;;;
 
 (defun mew-convert-mime-body (beg end cte linebasep)
-  (let* ((switch (if linebasep
-                     mew-prog-mime-encode-text-switch
-                   mew-prog-mime-encode-switch))
-	 file opt)
-    (save-restriction
-      (narrow-to-region beg end)
-      (cond
-       ((mew-case-equal cte mew-b64)
-	(when linebasep
-	  (goto-char (point-min))
-	  (mew-lf-to-crlf))
-	(base64-encode-region (point-min) (point-max))
-	(goto-char (point-max))
-	(insert "\n"))
-       ((mew-which-exec mew-prog-mime-encode)
-	(setq opt (mew-prog-mime-encode-get-opt cte switch))
-	(if (null opt)
-	    (mew-encode-error (concat "Unknown CTE: " cte))
-	  (setq file (mew-make-temp-name))
-	  (mew-frwlet mew-cs-dummy (if linebasep mew-cs-text-for-write mew-cs-binary)
-	    ;; NEVER use call-process-region for privacy reasons
-	    (write-region (point-min) (point-max) file nil 'no-msg)
-	    (delete-region (point-min) (point-max)))
-	  (let ((ret (condition-case nil
-			 (mew-piolet mew-cs-text-for-read mew-cs-dummy
-			   (apply 'call-process mew-prog-mime-encode file t nil opt))
-		       ;; a program which cannot be run at all
-		       (error nil))))
-	    (mew-delete-file file)
-	    (mew-encode-mime-body-check ret (point-min)))))
-       (t
-	(mew-encode-error (concat mew-prog-mime-encode " does not exist")))))))
+  (mew-mime-transfer-region beg end cte linebasep))
 
 (defun mew-convert-message ()
   ;; called on the beginning of a header

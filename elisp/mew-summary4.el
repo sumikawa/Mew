@@ -569,8 +569,6 @@ any, are killed."
   (interactive)
   (mew-summary-multi-msgs
    (cond
-    ((not (mew-which-exec mew-prog-mime-decode))
-     ())
     ((not (y-or-n-p "Uudecode these messages? "))
      ())
     (t
@@ -593,7 +591,7 @@ any, are killed."
 		 (goto-char (point-max))
 		 (unless (bolp) (insert "\n"))
 		 (write-region start (point-max) tmp 'append 'no-msg)))
-	     ;; mewencode writes to the file given here, never to the
+	     ;; Write to the selected file, never to the
 	     ;; name on the begin line, which comes from the message.
 	     (setq fn (mew-summary-input-file-name "Uudecode to: " name))
 	     (cond
@@ -602,11 +600,13 @@ any, are killed."
 	      ((and (file-exists-p fn)
 		    (not (y-or-n-p (format "File exists. Overwrite %s? " fn))))
 	       (message "Not decoded"))
-	      ((not (eq (call-process mew-prog-mime-decode nil nil nil
-				      "-d" "-u" tmp fn)
-			0))
-	       (message "Failed to execute %s" mew-prog-mime-decode))
 	      (t
+               (with-temp-buffer
+                 (set-buffer-multibyte nil)
+                 (insert-file-contents-literally tmp)
+                 (mew-mime-uu-decode-region (point-min) (point-max))
+                 (let ((coding-system-for-write 'no-conversion))
+                   (write-region (point-min) (point-max) fn nil 'no-msg)))
 	       (cd (file-name-directory fn))
 	       (setq fn (mew-summary-prog-exec mew-prog-compress "-df" "Z" fn))
 	       (setq fn (mew-summary-prog-exec mew-prog-gzip "-df" "gz" fn))

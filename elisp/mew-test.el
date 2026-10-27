@@ -1261,46 +1261,84 @@ underscore and a space the wrong way round and matches nothing."
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
-;;; mew-encode.el: a failing encoder
+;;; Native MIME transfer encodings
 ;;;
 
-(ert-deftest mew-test-encode-mime-body-check ()
-  "What the encoder printed has to go when it failed, since it sits
-where the encoded body would be and would be sent as the message."
-  (with-temp-buffer
-    (insert "kept")
-    (let ((beg (point-max)))
-      (insert "encoded body")
-      (mew-encode-mime-body-check 0 beg) ;; 0 means it worked
-      (should (equal (buffer-string) "keptencoded body"))))
-  (with-temp-buffer
-    (insert "kept")
-    (let ((beg (point-max)))
-      (insert "junk from a failing encoder")
-      (should-error (mew-encode-mime-body-check 1 beg))
-      (should (equal (buffer-string) "kept"))
-      (should (equal (mew-tinfo-get-encode-err)
-		     (concat mew-prog-mime-encode " failed")))))
-  ;; nil is a program which could not be run at all
-  (with-temp-buffer
-    (insert "junk")
-    (should-error (mew-encode-mime-body-check nil (point-min)))
-    (should (equal (buffer-string) ""))))
+(ert-deftest mew-test-native-transfer-roundtrip ()
+  (cl-letf (((symbol-function 'call-process)
+             (lambda (&rest _) (error "External encoder invoked"))))
+    (dolist (cte (list mew-b64 mew-qp mew-xg))
+      (dolist (textp '(nil t))
+        (dolist (data (list "" "hello\nworld\n" "no final newline"
+                            (unibyte-string 0 9 10 13 32 61 127 128 255)))
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (insert "prefix" data)
+            (mew-convert-mime-body 7 (point-max) cte textp)
+            (mew-mime-transfer-region 7 (point-max) cte textp t)
+            (should (equal (buffer-string) (concat "prefix" data)))))))))
 
-(ert-deftest mew-test-convert-mime-body-failure ()
-  "The whole path, with an encoder which prints and then fails."
-  (let* ((dir (make-temp-file "mew-test" 'dir))
-	 (mew-temp-dir dir)
-	 (mew-temp-file (expand-file-name "mew" dir)))
+(ert-deftest mew-test-native-qp-folding ()
+  (with-temp-buffer
+    (insert (make-string 200 ?x) " \n=\t\n")
+    (mew-convert-mime-body (point-min) (point-max) mew-qp t)
+    (goto-char (point-min))
+    (while (not (eobp))
+      (should (<= (- (line-end-position) (line-beginning-position)) 76))
+      (should-not (looking-at ".*[ \t]$"))
+      (forward-line))))
+
+(ert-deftest mew-test-native-decode-fixtures ()
+  (dolist (fixture `((,mew-b64 "aG Vs!bG8=\n" "hello")
+                     (,mew-qp "a=3Db=00=FF=\r\nc\r\n" ,(unibyte-string 97 61 98 0 255 99 13 10))
+                     (,mew-xuu "preamble\nbegin 644 ignored\n#0V%T\n`\nend\n" "Cat")))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert (nth 1 fixture))
+      (goto-char (point-min))
+      (mew-decode-mime-body nil "application/octet-stream" (car fixture))
+      (should (equal (buffer-string) (nth 2 fixture))))))
+
+(ert-deftest mew-test-native-gzip-block-boundary ()
+  (dolist (n '(65535 65536 131072))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert (mew-mime-gzip-string (make-string n ?a)))
+      (should (zlib-decompress-region (point-min) (point-max)))
+      (should (equal (buffer-string) (make-string n ?a))))))
+
+(ert-deftest mew-test-native-decode-failure-preserves-body ()
+  (dolist (cte (list mew-xuu mew-xg "unknown"))
+    (with-temp-buffer
+      (insert "prefixbroken input")
+      (should-error (mew-mime-transfer-region 7 (point-max) cte nil t))
+      (should (equal (buffer-string) "prefixbroken input")))))
+
+(ert-deftest mew-test-native-encode-attachment ()
+  (let ((file (make-temp-file "mew-attachment"))
+        (data (unibyte-string 0 10 13 128 255)))
     (unwind-protect
-	(cl-letf (((symbol-function 'mew-which-exec) (lambda (&rest _) "mewencode"))
-		  ((symbol-function 'call-process)
-		   (lambda (&rest _) (insert "junk from a failing encoder\n") 1)))
-	  (with-temp-buffer
-	    (insert "hello\n")
-	    (should-error (mew-convert-mime-body (point-min) (point-max) mew-qp t))
-	    (should (equal (buffer-string) ""))))
-      (delete-directory dir 'recursive))))
+        (progn
+          (let ((coding-system-for-write 'no-conversion))
+            (write-region data nil file nil 'silent))
+          (dolist (cte (list mew-b64 mew-qp mew-xg))
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (insert "prefix")
+              (mew-encode-mime-body '("application/octet-stream") cte file nil)
+              (mew-mime-transfer-region 7 (point-max) cte nil t)
+              (should (equal (buffer-string) (concat "prefix" data))))))
+      (delete-file file))))
+
+(ert-deftest mew-test-native-8bit-file ()
+  (let ((file (make-temp-file "mew-8bit")))
+    (unwind-protect
+        (let ((coding-system-for-write 'no-conversion))
+          (write-region "ascii\n" nil file nil 'silent)
+          (should-not (mew-encode-file-8bitp file))
+          (write-region (unibyte-string 0 255) nil file nil 'silent)
+          (should (mew-encode-file-8bitp file)))
+      (delete-file file))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
