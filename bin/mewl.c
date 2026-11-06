@@ -21,6 +21,7 @@ private char version_message[] = "version 6.11 20260414 Mew developing team";
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/stat.h>
 #ifdef HAVE_ICONV
 # include <iconv.h>
@@ -31,10 +32,8 @@ private char version_message[] = "version 6.11 20260414 Mew developing team";
 
 #ifdef HAVE_DIRENT_H
 # include <dirent.h>
-# define NAMLEN(dirent) strlen((dirent)->d_name)
 #else /* HAVE_DIRENT_H */
 # define dirent direct
-# define NAMLEN(dirent) (dirent)->d_namlen
 # ifdef HAVE_SYS_NDIR_H
 #  include <sys/ndir.h>
 # endif /* HAVE_SYS_NDIR_H */
@@ -57,6 +56,10 @@ private char version_message[] = "version 6.11 20260414 Mew developing team";
 #ifdef HAVE_PWD_H
 # include <pwd.h>
 #endif /* HAVE_PWD_H */
+
+#ifdef HAVE_FORK
+# include <sys/wait.h>
+#endif /* HAVE_FORK */
 
 /****************************************************************
  * 
@@ -103,7 +106,7 @@ struct dbuf {
 	size_t siz;
 };
 
-private char Buf_header[MAX_HEADER + 1]; /* + 1 for a NUL after what is read */
+private char Buf_header[MAX_HEADER + 2]; /* + 1 for an appended LF, + 1 for a NUL */
 private char Buf_filenm[MAX_FILE_NAME_LEN];
 private char Buf_filenm2[MAX_FILE_NAME_LEN];
 private char *Mail_home;
@@ -118,8 +121,8 @@ private char *Input_file = NULL;
 private char *Suffix = NULL;
 
 private int All_fields = 0;
-private int Field_len = MAX_FIELD_LEN;
-private int Body_len = MAX_BODY_LEN;
+private unsigned int Field_len = MAX_FIELD_LEN;
+private unsigned int Body_len = MAX_BODY_LEN;
 private int PrintNumOfMsg = NO;
 private int Suffix_len = 0;
 
@@ -156,25 +159,32 @@ private int  field_match(char *, char *, int);
 private int  print_for_scan(FILE *, char *, char *);
 private int  print_for_sort(FILE *, char *, char *);
 private int  print_for_pick(FILE *, char *, char *);
-private int  scan_numfile(char *, unsigned int, unsigned int);
-private int  scan_intcompare(unsigned int *, unsigned int *);
+private int  scan_numfile(char *, unsigned int, unsigned int, unsigned int *);
+private int  scan_intcompare(const void *, const void *);
+private unsigned int str_to_uint(const char *);
 private int  scan_folder(struct fld_rng *);
 private void scan_init(unsigned int);
+private FILE *open_message(const char *);
 private FILE *scan_getfile(char **, char **);
 private void exec_init(unsigned int);
+private char *read_filename_line(char *, size_t);
 private FILE *exec_getfile(char **, char **);
+private int  exec_wait(void);
 private void stdin_init(unsigned int);
+private int  hexval(int);
+private char *unhex(const char *);
 private void set_fld_rng(struct fld_rng *, char *, char *);
-#ifdef HAVE_ICONV
 private void dbuf_reserve(struct dbuf *, size_t);
 private void dbuf_append(struct dbuf *, const char *, size_t);
 private char *decode_field(const char *);
 private int  decode_word(const char *, size_t, struct dbuf *);
+#ifdef HAVE_ICONV
+private int  charset_to_utf8(const char *, const char *, size_t, struct dbuf *);
 private iconv_t get_iconv_to_utf8(const char *);
 private int  iconv_to_utf8(const char *, const char *, size_t, struct dbuf *,
     int);
-private int  b64_pton(const char *, unsigned char *, size_t);
 #endif /* HAVE_ICONV */
+private int  b64_pton(const char *, unsigned char *, size_t);
 
 /****************************************************************
  * 
@@ -201,15 +211,17 @@ help_message[] = {
 	" -l  <length>  Field max length to dump. (0 means no limit)",
 	" -n            Don't use fstat().",
 	" -p  <pattern> Pick pattern.",
+	" -P  <hex>     Pick pattern in hexadecimal.",
 	" -s  <src>     Message source: '+folder range'.",
 	" -w            Wait for stdio input to synchronize.",
 	" -v            Display the version.",
-	" -x            Use this suffix.",
+	" -x  <suffix>  Use this suffix.",
 	"",
 	"<range> = N | [start]-[end] | last:N", 
 	"<pattern> = 'key=val' | 'key!=val' | '!<pattern>' | '(<pattern>)' ",
 	"          | '<pattern>&<pattern>' ",
 	"          | '<pattern>|<pattern>' ",
+	"          A value with a space must be double-quoted, e.g. key=\"a b\".",
 	"",
 	"Default is mdir = ~/Mail,",
 	"length = 5, folder = +inbox, range = 0, bodylen = 20",
@@ -257,9 +269,10 @@ ch_home() {
 
 private void
 ch_mail_home(char *dir) {
-	char *p = dir + 1, c;
+	char *p, c;
 
-	if (dir == NULL) warn_exit("%s not exist.", dir);
+	if (dir == NULL) warn_exit("mail home directory is not set.");
+	p = dir + 1;
 	c = *dir;
 	switch (c) {
 	case '~':
@@ -347,10 +360,8 @@ nextline(char *p, char *lim, int hdr_only) {
 	p++;
 	if (p < lim)
 		return p;
-	else {
-		*(lim - 1) = LF;
+	else
 		return NULL;
-	}
 }
 
 /*
@@ -370,7 +381,7 @@ nextline(char *p, char *lim, int hdr_only) {
 
 private char *
 nextfield(char *p, char *lim, char **truncated_end, char **prev_beg, int hdr_only) {
-	int i = 0;
+	unsigned int i = 0;
 	char *q;
 	*truncated_end = NULL;
 
@@ -388,6 +399,8 @@ nextfield(char *p, char *lim, char **truncated_end, char **prev_beg, int hdr_onl
 
 private char *
 eoh(char *p, char *lim) {
+	if (p < lim && *p == LF)
+		return p + 1; /* empty header: the body begins immediately */
 	while (p < lim) {
 		if (*p == LF && p + 1 < lim && *(p + 1) == LF)
 			return p + 1;
@@ -397,13 +410,19 @@ eoh(char *p, char *lim) {
 }
 
 /*
- * Read the start of a message into Buf_header and end it with a NUL, so
- * that nothing which scans it runs past what was read, even when it is empty.
+ * Read the start of a message into Buf_header, end it with a newline when
+ * it has none, and then with a NUL, so that nothing which scans it runs past
+ * what was read, even when it is empty.
  */
 private int
 read_header(FILE *fp) {
 	int lim = fread(Buf_header, sizeof(char), MAX_HEADER, fp);
 
+	/* End the data with a newline when it has none, so that the line
+	   scanning always finds a terminator without overwriting the last
+	   byte that was read. */
+	if (lim > 0 && Buf_header[lim - 1] != LF)
+		Buf_header[lim++] = LF;
 	Buf_header[lim] = NUL;
 	return lim;
 }
@@ -540,6 +559,8 @@ print_field(char *buf, int lim, char *fname, char *fld) {
 		while (i < Body_len) {
 			q = p;
 			p = nextline(q, limp, NO);
+			/* Double a leading dot, also on the last line. */
+			if (q < limp && *q == '.') printf(".");
 			if (p == NULL) {
 				while (q < limp) {
 					putchar(*q);
@@ -548,7 +569,6 @@ print_field(char *buf, int lim, char *fname, char *fld) {
 				break;
 			}
 			i++;
-			if (*q == '.') printf(".");
 			while (q < p) {
 				putchar(*q);
 				q++;
@@ -721,19 +741,17 @@ search_string(char *key, char *value, int case_sensitive) {
 			if (end != NULL)
 				end--;		/* end == LF */
 			else if (p == NULL)
-				end = limp - 1;	/* end == LF, see nextline */
+				end = limp - 1;	/* end == LF, see read_header() */
 			else
 				end = p - 1;	/* end == LF */
 			tmp = *end;
 			*end = NUL;
 
-#ifdef HAVE_ICONV
 			if (strstr(beg, "=?") != NULL)
 				/* the field body begins after ":" */
 				val = dec = decode_field(*beg == ':' ?
 				    beg + 1 : beg);
 			else
-#endif /* HAVE_ICONV */
 				val = beg;
 
 			if (field_match(val, value, case_sensitive)) {
@@ -762,7 +780,6 @@ int ends_with(const char *str, const char *suffix) {
 	return strncmp(str + str_len - suffix_len, suffix, suffix_len) == 0;
 }
 
-#ifdef HAVE_ICONV
 /****************************************************************
  *
  * RFC 2047 decoding
@@ -825,24 +842,6 @@ decode_field(const char *str) {
 	return ret.buf;
 }
 
-/* MIME charsets renamed for iconv, and supersets to retry with on failure */
-private struct {
-	const char *mime;
-	const char *iconv;		/* NULL: as it is */
-	const char *retry;		/* NULL: no retry */
-} rfc2047_charsets[] = {
-	{	"ks_c_5601-1987",	"CP949",	NULL		},
-	{	"windows-31j",		"CP932",	NULL		},
-	{	"iso-8859-8-i",		"ISO-8859-8",	NULL		},
-	{	"iso-2022-jp",		NULL,		"CP50221"	},
-	{	"shift_jis",		NULL,		"CP932"		},
-	{	"euc-jp",		NULL,		"EUC-JP-MS"	},
-	{	"gb2312",		NULL,		"GB18030"	},
-	{	"big5",			NULL,		"BIG5-HKSCS"	},
-	{	"euc-kr",		NULL,		"CP949"		},
-	{	"tis-620",		NULL,		"CP874"		}
-};
-
 #define CHARSET_MAX	64
 
 /* token of RFC 2047, with "\" of erratum 506 */
@@ -867,7 +866,7 @@ private struct {
 private int
 decode_word(const char *str, size_t size, struct dbuf *out) {
 	int i, j, len, enc, retsz;
-	const char *p, *name, *retry = NULL;
+	const char *p;
 	char cs[CHARSET_MAX];
 	char *tmp = NULL, *in;
 	size_t tmpsz = 0, insz, olen, s, d;
@@ -960,22 +959,18 @@ decode_word(const char *str, size_t size, struct dbuf *out) {
 		break;
 	}
 
-	name = cs;
-	for (i = 0; i < (int)nitems(rfc2047_charsets); i++) {
-		if (strlen(rfc2047_charsets[i].mime) == strlen(cs) &&
-		    strncasecmp(rfc2047_charsets[i].mime, cs, strlen(cs)) == 0) {
-			if (rfc2047_charsets[i].iconv != NULL)
-				name = rfc2047_charsets[i].iconv;
-			retry = rfc2047_charsets[i].retry;
-			break;
-		}
-	}
 	olen = out->len;
-	if (iconv_to_utf8(name, in, insz, out, NO) != 0 &&
-	    (retry == NULL || iconv_to_utf8(retry, in, insz, out, NO) != 0) &&
-	    (retry == NULL || iconv_to_utf8(retry, in, insz, out, YES) != 0) &&
-	    iconv_to_utf8(name, in, insz, out, YES) != 0)
+#ifdef HAVE_ICONV
+	if (charset_to_utf8(cs, in, insz, out) != 0)
 		goto fail;	/* unknown charset */
+#else /* HAVE_ICONV */
+	/*
+	 * Without iconv, append the bytes as they are whatever the charset
+	 * is: UTF-8 and US-ASCII are right as they are, and ASCII in the
+	 * others, such as the name of a mailing list, can still be found.
+	 */
+	dbuf_append(out, in, insz);
+#endif /* HAVE_ICONV */
 
 	/* remove control characters but TAB as Mew does */
 	for (s = d = olen; s < out->len; s++) {
@@ -991,6 +986,52 @@ decode_word(const char *str, size_t size, struct dbuf *out) {
 fail:
 	free(tmp);
 	return -1;
+}
+
+#ifdef HAVE_ICONV
+/* MIME charsets renamed for iconv, and supersets to retry with on failure */
+private struct {
+	const char *mime;
+	const char *iconv;		/* NULL: as it is */
+	const char *retry;		/* NULL: no retry */
+} rfc2047_charsets[] = {
+	{	"ks_c_5601-1987",	"CP949",	NULL		},
+	{	"windows-31j",		"CP932",	NULL		},
+	{	"iso-8859-8-i",		"ISO-8859-8",	NULL		},
+	{	"utf8",			"UTF-8",	NULL		},
+	{	"iso-2022-jp",		NULL,		"CP50221"	},
+	{	"shift_jis",		NULL,		"CP932"		},
+	{	"euc-jp",		NULL,		"EUC-JP-MS"	},
+	{	"gb2312",		NULL,		"GB18030"	},
+	{	"big5",			NULL,		"BIG5-HKSCS"	},
+	{	"euc-kr",		NULL,		"CP949"		},
+	{	"tis-620",		NULL,		"CP874"		}
+};
+
+/*
+ * Append "insz" bytes at "in" in the charset "cs" to "out" as UTF-8.
+ * Return -1, leaving "out" as it was, if the charset is unknown.
+ */
+private int
+charset_to_utf8(const char *cs, const char *in, size_t insz, struct dbuf *out) {
+	const char *name = cs, *retry = NULL;
+	int i;
+
+	for (i = 0; i < (int)nitems(rfc2047_charsets); i++) {
+		if (strlen(rfc2047_charsets[i].mime) == strlen(cs) &&
+		    strncasecmp(rfc2047_charsets[i].mime, cs, strlen(cs)) == 0) {
+			if (rfc2047_charsets[i].iconv != NULL)
+				name = rfc2047_charsets[i].iconv;
+			retry = rfc2047_charsets[i].retry;
+			break;
+		}
+	}
+	if (iconv_to_utf8(name, in, insz, out, NO) != 0 &&
+	    (retry == NULL || iconv_to_utf8(retry, in, insz, out, NO) != 0) &&
+	    (retry == NULL || iconv_to_utf8(retry, in, insz, out, YES) != 0) &&
+	    iconv_to_utf8(name, in, insz, out, YES) != 0)
+		return -1;
+	return 0;
 }
 
 private iconv_t
@@ -1046,6 +1087,7 @@ iconv_to_utf8(const char *cs, const char *in, size_t insz, struct dbuf *out,
 	out->buf[out->len] = NUL;
 	return 0;
 }
+#endif /* HAVE_ICONV */
 
 private int
 b64_pton(const char *src, unsigned char *dst, size_t dstsiz) {
@@ -1104,7 +1146,6 @@ b64_pton(const char *src, unsigned char *dst, size_t dstsiz) {
 
 	return k;
 }
-#endif /* HAVE_ICONV */
 
 /****************************************************************
  * 
@@ -1133,7 +1174,7 @@ print_for_sort(FILE *fp, char *fname, char *fld) {
 			if (end != NULL)
 				end--;
 			else if (p == NULL) {
-				end = limp;
+				end = limp - 1;
 			} else
 				end = p - 1;
 			break;
@@ -1185,12 +1226,15 @@ private unsigned int Scan_ctx_buf_size;
 private unsigned int *Scan_ctx_buf;
 
 private int
-scan_numfile(char *s, unsigned int first, unsigned int last) {
-	int num = 0;
+scan_numfile(char *s, unsigned int first, unsigned int last, unsigned int *out) {
+	unsigned int num = 0, d;
 	unsigned char c;
 
 	while ((c = *s) != NUL && isdigit(c)) {
-		num = num * 10 + c - '0';
+		d = c - '0';
+		if (num > (UINT_MAX - d) / 10)
+			return FALSE; /* too large to be a message number */
+		num = num * 10 + d;
 		s++;
 	}
 
@@ -1203,24 +1247,50 @@ scan_numfile(char *s, unsigned int first, unsigned int last) {
 	else
 		return FALSE;
 
-	if (num >= first && (last == 0 || num <= last))
+	if (num >= first && (last == 0 || num <= last)) {
+		*out = num;
 		return TRUE;
-        else
-                return FALSE;
+	} else
+		return FALSE;
 }
 
 private int
-scan_intcompare(unsigned int *i, unsigned int *j) {
-	if (*i > *j)
+scan_intcompare(const void *a, const void *b) {
+	unsigned int i = *(const unsigned int *)a;
+	unsigned int j = *(const unsigned int *)b;
+	if (i > j)
 		return 1;
-	if (*i < *j)
+	if (i < j)
 		return -1;
 	return 0;
 }
 
+/*
+ * Detect errors when converting a string to a number.
+ * Return 0 for an empty/non-numeric string (as atoi did), but bail out
+ * on overflow or a negative value instead of silently wrapping.
+ */
+private unsigned int
+str_to_uint(const char *s) {
+	char *end;
+	unsigned long v;
+	const char *p = s;
+
+	while (isspace((unsigned char)*p)) p++;	/* as strtoul() skips */
+	if (*p == '-')
+		warn_exit("negative number: %s", s);
+	errno = 0;
+	v = strtoul(p, &end, 10);
+	if (end == p)
+		return 0;
+	if (errno == ERANGE || v > UINT_MAX)
+		warn_exit("number out of range: %s", s);
+	return (unsigned int)v;
+}
+
 private int
 scan_folder(struct fld_rng *fr) {
-	unsigned int num = 0;
+	unsigned int num = 0, msgnum;
 	unsigned int first = fr->first, last = fr->last;
 	DIR *dirp;
 	struct dirent *dp;
@@ -1235,19 +1305,18 @@ scan_folder(struct fld_rng *fr) {
 	while ((dp = readdir(dirp)) != NULL) {
 		fname = dp->d_name;
 
-		if (scan_numfile(fname, first, last)) {
+		if (scan_numfile(fname, first, last, &msgnum)) {
 			if (num == Scan_ctx_buf_size) {
 				Scan_ctx_buf_size += NUMBER_OF_FILE;
-				Scan_ctx_buf = (unsigned int *)realloc(Scan_ctx_buf, Scan_ctx_buf_size * sizeof(unsigned int));
+				REALLOC(Scan_ctx_buf, Scan_ctx_buf_size * sizeof(unsigned int));
 			}
-			*(Scan_ctx_buf + num) = atoi(fname);
+			*(Scan_ctx_buf + num) = msgnum;
 			num++;
 		}
 	}
 	closedir(dirp);
 
-	qsort(Scan_ctx_buf, num, sizeof(int),
-	      (int (*)(const void *, const void *)) scan_intcompare);
+	qsort(Scan_ctx_buf, num, sizeof(unsigned int), scan_intcompare);
 
 	if (fr->num > 0 && fr->num < num) {
 		for (i = 0; i < fr->num; i++)
@@ -1256,7 +1325,7 @@ scan_folder(struct fld_rng *fr) {
 	}
 
 	if (PrintNumOfMsg == YES && num > 0 && Scan_ctx_folders == 1) {
-		printf("NumOfMsg: %d\n", num);
+		printf("NumOfMsg: %u\n", num);
 		fflush(stdout);
 	}
 	return num;
@@ -1267,7 +1336,31 @@ scan_init(unsigned int folders) {
 	Scan_ctx_folders = folders;
 	Scan_ctx_messages = 0;
 	Scan_ctx_buf_size = NUMBER_OF_FILE;
-	MALLOC(Scan_ctx_buf, Scan_ctx_buf_size * sizeof(int));
+	MALLOC(Scan_ctx_buf, Scan_ctx_buf_size * sizeof(unsigned int));
+}
+
+/*
+ * Open a message file without blocking.  A FIFO or a device opened with
+ * the usual blocking semantics would hang open() until a writer (or the
+ * hardware) is ready; O_NONBLOCK makes open() return immediately.  Such
+ * non-regular files are filtered out afterwards by the fstat()/S_ISREG()
+ * check in main(), unless -n turns it off.  O_NONBLOCK has no effect on
+ * reads from regular files.
+ */
+private FILE *
+open_message(const char *name) {
+#if defined(HAVE_FCNTL_H) && defined(O_NONBLOCK)
+	int fd = open(name, O_RDONLY | O_NONBLOCK);
+	FILE *fp;
+
+	if (fd < 0)
+		return NULL;
+	if ((fp = fdopen(fd, FDREAD)) == NULL)
+		close(fd);
+	return fp;
+#else
+	return fopen(name, FDREAD);
+#endif
 }
 
 private FILE *
@@ -1287,19 +1380,19 @@ scan_getfile(char **filename, char **foldername) {
 	*foldername = Folders[j - 1].folder;
 					    
 	while (i < Scan_ctx_messages) {
-		snprintf(Buf_filenm, sizeof(Buf_filenm), "%d", *(Scan_ctx_buf + i));
-		snprintf(Buf_filenm2, sizeof(Buf_filenm2), "%d%s", *(Scan_ctx_buf + i), Suffix);
-		fp = fopen(Buf_filenm2, FDREAD);
-		if (fp == NULL) fp = fopen(Buf_filenm, FDREAD);
+		snprintf(Buf_filenm, sizeof(Buf_filenm), "%u", *(Scan_ctx_buf + i));
+		snprintf(Buf_filenm2, sizeof(Buf_filenm2), "%u%s", *(Scan_ctx_buf + i), Suffix);
+		fp = open_message(Buf_filenm2);
+		if (fp == NULL) fp = open_message(Buf_filenm);
 		if (fp != NULL) {
 			i++;
 			*filename = Buf_filenm;
 			return fp;
 		}
-		snprintf(Buf_filenm, sizeof(Buf_filenm), "0%d", *(Scan_ctx_buf + i));
-		snprintf(Buf_filenm2, sizeof(Buf_filenm2), "0%d%s", *(Scan_ctx_buf + i), Suffix);
-		fp = fopen(Buf_filenm2, FDREAD);
-		if (fp == NULL) fp = fopen(Buf_filenm, FDREAD);
+		snprintf(Buf_filenm, sizeof(Buf_filenm), "0%u", *(Scan_ctx_buf + i));
+		snprintf(Buf_filenm2, sizeof(Buf_filenm2), "0%u%s", *(Scan_ctx_buf + i), Suffix);
+		fp = open_message(Buf_filenm2);
+		if (fp == NULL) fp = open_message(Buf_filenm);
 		if (fp != NULL) {
 			i++;
 			*filename = Buf_filenm;
@@ -1317,6 +1410,8 @@ scan_getfile(char **filename, char **foldername) {
  */
 
 #ifdef HAVE_FORK
+private int Exec_pid = 0; /* pid of the -e child, 0 if none */
+
 private void
 exec_init(unsigned int num) { /* num == 0 */
 	int childpid;
@@ -1336,8 +1431,12 @@ exec_init(unsigned int num) { /* num == 0 */
 		int lim = MAX_ARGC - 2;
 		char *p;
 	
-		close(WRITE);
-		dup(pipes[WRITE]);
+		if (dup2(pipes[WRITE], WRITE) < 0) {
+			warning("can't redirect pipe.");
+			_exit(EXIT_FAILURE);
+		}
+		if (pipes[WRITE] != WRITE)
+			close(pipes[WRITE]); /* reachable as fd 1 now */
 		close(pipes[READ]);
 
 		Argvec[i++] = Exec_cmd;
@@ -1354,13 +1453,37 @@ exec_init(unsigned int num) { /* num == 0 */
 		Argvec[i++] = NULL;
 		
 		execvp(Exec_cmd, Argvec);
-		warn_exit("'%s' command not found.", Exec_cmd);
+		/* _exit(): exit() would flush stdio buffers inherited from
+		   the parent and run its atexit handlers in the child. */
+		warning("'%s' command not found.", Exec_cmd);
+		_exit(EXIT_FAILURE);
 	}
 
 	/* I'm the parent. */
-	close(READ);
-	dup(pipes[READ]);
+	Exec_pid = childpid;
+	if (dup2(pipes[READ], READ) < 0)
+		warn_exit("can't redirect pipe.");
+	if (pipes[READ] != READ)
+		close(pipes[READ]); /* reachable as fd 0 now */
 	close(pipes[WRITE]);
+}
+
+/*
+ * Reap the -e child so it does not linger as a zombie, and report
+ * whether it failed (non-zero exit or killed by a signal) so that
+ * mewl's own exit status reflects it.
+ */
+private int
+exec_wait(void) {
+	int status;
+
+	if (Exec_pid <= 0)
+		return 0;
+	if (waitpid(Exec_pid, &status, 0) < 0)
+		return 1;
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status) != 0;
+	return 1; /* terminated by a signal */
 }
 #else  /* HAVE_FORK */
 private void
@@ -1370,22 +1493,41 @@ exec_init(unsigned int num) { /* num == 0 */
 	STRCPY(Current_folder, Folders[0].folder);
 	ch_folder(Current_folder);
 }
+
+private int
+exec_wait(void) {
+	return 0; /* no child without fork() */
+}
 #endif /* HAVE_FORK */
+
+/*
+ * Read one newline-terminated line from stdin into buf, without the LF.
+ * Unlike fgets()+strchr(LF), this consumes bytes up to the newline even
+ * when the line contains an embedded NUL, so the following line is never
+ * dropped.  An overlong line is truncated to the buffer and the
+ * rest is consumed.  Returns NULL only at end of input with no data.
+ */
+private char *
+read_filename_line(char *buf, size_t size) {
+	size_t n = 0;
+	int c;
+
+	while ((c = getc(stdin)) != EOF && c != LF)
+		if (n < size - 1)
+			buf[n++] = (char)c;
+	if (c == EOF && n == 0)
+		return NULL;
+	buf[n] = NUL;
+	return buf;
+}
 
 private FILE *
 exec_getfile(char **filename, char **foldername) {
 	FILE *fp;
-	char *p, *q, *r;
-	int c;
+	char *p, *r;
 
 	*foldername = Current_folder;
-	while ((p = fgets(Buf_filenm, sizeof(Buf_filenm), stdin)) != NULL) {
-		if ((q = strchr(Buf_filenm, LF)) != NULL)
-			*q = NUL;
-		else {
-			Buf_filenm[MAX_FILE_NAME_LEN - 1] = NUL;
-			while ((c = getchar()) != LF && c != EOF) ;
-		}
+	while ((p = read_filename_line(Buf_filenm, sizeof(Buf_filenm))) != NULL) {
 		if (STRCMP(p, CHDIR) == 0) {
 			no_fld_flag = 0;
 			default_fld_error_flag = 0;
@@ -1406,10 +1548,10 @@ exec_getfile(char **filename, char **foldername) {
 			r = p + strlen(p) - Suffix_len;
 		else
 			r = NULL;
-		fp = fopen(*filename, FDREAD);
+		fp = open_message(*filename);
 		if (r != NULL) *r = NUL; // remove suffix
 		if (fp != NULL) return fp;
-		fp = fopen(*filename, FDREAD); // try again without suffix
+		fp = open_message(*filename); // try again without suffix
 		if (fp != NULL) return fp;
 	}
 	return NULL;
@@ -1455,14 +1597,14 @@ set_fld_rng(struct fld_rng *fr, char *arg1, char *arg2) {
 	else if (strncmp(range, "last:", 5) == 0) {
 		range += 5;
 		fr->first = fr->last = 0;
-		fr->num = atoi(range);
+		fr->num = str_to_uint(range);
 	} else if ((last = strchr(range, '-')) == NULL) {
-		fr->first = fr->last = atoi(range);
+		fr->first = fr->last = str_to_uint(range);
 		fr->num = 0;
 	} else {
 		*last++ = NUL;
-		fr->first = atoi(range);
-		fr->last = atoi(last);
+		fr->first = str_to_uint(range);
+		fr->last = str_to_uint(last);
 		fr->num = 0;
 	}
 
@@ -1476,6 +1618,36 @@ set_fld_rng(struct fld_rng *fr, char *arg1, char *arg2) {
  * main
  *
  */
+
+/*
+ * Emacs on Windows passes arguments through the ANSI code page, which
+ * mangles UTF-8.  So Mew may send the pattern as hex digits instead.
+ */
+private int
+hexval(int c) {
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+private char *
+unhex(const char *hex) {
+	size_t len = strlen(hex), i;
+	char *buf;
+
+	if (len % 2 != 0)
+		warn_exit("odd length of hex pattern.");
+	MALLOC(buf, len / 2 + 1);
+	for (i = 0; i < len; i += 2) {
+		int hi = hexval(hex[i]), lo = hexval(hex[i + 1]);
+		if (hi < 0 || lo < 0)
+			warn_exit("invalid hex pattern.");
+		buf[i / 2] = (char)(hi << 4 | lo);
+	}
+	buf[len / 2] = NUL;
+	return buf;
+}
 
 int
 main(int argc, char **argv) {
@@ -1495,7 +1667,7 @@ main(int argc, char **argv) {
 	warn_prog = progname;
 	STRDUP(Mail_home, MAILHOME);
 
-	while ((optc = Getopt(argc, argv, "ab:c:d:e:f:hi:l:m:np:s:vwx:")) != EOF) {
+	while ((optc = Getopt(argc, argv, "ab:c:d:e:f:hi:l:m:np:P:s:vwx:")) != EOF) {
 		switch (optc) {
 		case 'a':
 			All_fields++;
@@ -1504,7 +1676,7 @@ main(int argc, char **argv) {
 			STRDUP(Mail_home, Optarg);
 			break;
 		case 'c':
-			Body_len = atoi(Optarg);
+			Body_len = str_to_uint(Optarg);
 			break;
 		case 'd':
 			STRDUP(Key_field, Optarg);
@@ -1525,7 +1697,7 @@ main(int argc, char **argv) {
 			STRDUP(Input_file, Optarg);
 			break;
 		case 'l':
-			Field_len = atoi(Optarg);
+			Field_len = str_to_uint(Optarg);
 			break;
 		case 'm':
 			STRDUP(Exec_arg, Optarg);
@@ -1535,6 +1707,9 @@ main(int argc, char **argv) {
 			break;
 		case 'p':
 			STRDUP(pattern, Optarg);
+			break;
+		case 'P':
+			pattern = unhex(Optarg);
 			break;
 		case 's':
 			if (lim >= MAX_FOLDER)
@@ -1606,13 +1781,19 @@ main(int argc, char **argv) {
 	else
 		func_print = print_for_scan;
 		
-	dup2(READ, SYNC);
+	if (dup2(READ, SYNC) < 0)
+		warn_exit("can't duplicate stdin.");
+#ifdef FD_CLOEXEC
+	/* Keep the sync descriptor from leaking into the -e child. */
+	if (fcntl(SYNC, F_SETFD, FD_CLOEXEC) < 0)
+		warn_exit("can't set close-on-exec.");
+#endif
 	sync = fdopen(SYNC, FDREAD);
 	(*func_init)(lim);
 	while ((fp = (*func_getfile)(&filename, &foldername)) != NULL) {
 		if (nflag != 0) {
-			fstat(fileno(fp), &st);
-			if (!(st.st_mode & S_IFREG)) {
+			if (fstat(fileno(fp), &st) != 0 ||
+			    !S_ISREG(st.st_mode)) {
 				fclose(fp);
 				continue;
 			}
@@ -1625,7 +1806,7 @@ main(int argc, char **argv) {
 		fclose(fp);
 	}
 
-	exit(EXIT_SUCCESS);
+	exit(exec_wait() ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
 /* 

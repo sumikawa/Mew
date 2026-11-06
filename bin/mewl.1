@@ -84,7 +84,7 @@ Set the input stream to
 .BI \-l " length"
 Set the max field length to be extracted to
 .IR length .
-The default value is 3. 0 means no limit.
+The default value is 5. 0 means no limit.
 .TP 8
 .B \-n
 Don't use fstat().
@@ -92,6 +92,9 @@ Don't use fstat().
 .BI \-p " pattern"
 Specify the pick
 .IR pattern .
+.TP 8
+.BI \-P " hex"
+Specify the pick pattern as hexadecimal digits of its bytes.
 .TP 8
 .BI \-s " src"
 Set message source to
@@ -118,14 +121,16 @@ N | [start]-[end] | last:N
 | '!<pattern>' | '(<pattern>)'
 | '<pattern>&<pattern>' | '<pattern>|<pattern>'
 .PP
-If built with iconv,
 .B mewl
-decodes encoded-words of RFC 2047 in a field body into UTF-8 before
-comparing it with
-.IR val ,
-so
+decodes encoded-words of RFC 2047 in a field body before comparing it
+with
+.IR val .
+If built with iconv, it converts them into UTF-8, so
 .I val
 should be given in UTF-8.
+Without iconv, the decoded bytes are compared as they are:
+encoded-words in UTF-8 are found as with iconv, and in the other
+charsets only ASCII, such as the name of a mailing list, is found.
 .PP
 If built with utf8proc,
 the case-sensitive operators (== and !==) compare a field body with
@@ -146,9 +151,19 @@ compared byte by byte; = and != then ignore the case of ASCII letters
 only.
 The key "head" (the whole header) and the body are compared as they
 are, neither decoded nor normalized.
+.PP
+A
+.I val
+that contains a space or one of the pattern characters
+(=, !=, &, |, !, ( or )) must be enclosed in double quotes,
+as in subject=\(dqfoo bar\(dq.
+Single quotes are not recognized as quotes.
+A malformed pattern, such as one with an unquoted space,
+is rejected with \(lqbroken pattern.\(rq instead of being
+evaluated in part.
 
 .\"
 .SH BUGS
-If a field is long, only the beginning three lines are extracted 
+If a field is long, only the beginning five lines are extracted 
 by default.
 .\"

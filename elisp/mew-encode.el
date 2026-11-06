@@ -404,9 +404,15 @@ Normalize decoded CRLF only for LINEBASEP content."
 ;;;
 
 (defun mew-encode-set-privacy (pnm privacy case)
-  (unless (or (mew-syntax-get-privacy mew-encode-syntax) ;; specified
-	      ;; encryption previously failed, so bypass.
-	      (and (null privacy) (mew-tinfo-get-privacy-err)))
+  (cond
+   ((mew-syntax-get-privacy mew-encode-syntax)) ;; specified
+   ((and (null privacy) (mew-tinfo-get-privacy-err))
+    ;; Protecting failed last time.  Sending again would go out as
+    ;; it is, so say so instead of doing it silently.
+    (let ((err (or (mew-tinfo-get-encode-err) "Protecting this message failed")))
+      (unless (y-or-n-p (format "%s.  Send it without protection? " err))
+	(mew-encode-error err))))
+   (t
     (let (type)
       (cond
        (privacy
@@ -422,7 +428,7 @@ Normalize decoded CRLF only for LINEBASEP content."
        (mew-pcdb-ct (mew-pcdb-by-service type)))
       ;; recipients are ignored when signing
       (mew-syntax-set-decrypters
-       mew-encode-syntax (mew-smtp-get-recipients pnm)))))
+       mew-encode-syntax (mew-smtp-get-recipients pnm))))))
 
 (defun mew-encode-make-header (&optional addsep resentp)
   (unless (mew-header-existp mew-mv:)
@@ -1396,6 +1402,15 @@ Normalize decoded CRLF only for LINEBASEP content."
       (cons "Message:" (mew-tinfo-get-hdr-file))) ;; Header mode
      'nobackup)
     nil)) ;; to save
+
+(defun mew-encode-delete-backup ()
+  "Delete the backup and the info file of this draft.
+They are of no use once the draft is sent or killed, and the backup
+is the draft before encoding: the plain text of an encrypted message."
+  (let ((file (buffer-file-name)))
+    (when file
+      (mew-delete-file (mew-prepend-prefix file mew-backup-prefix))
+      (mew-delete-file (concat file mew-draft-info-suffix)))))
 
 (defun mew-encode-load-syntax ()
   (let* ((file (buffer-file-name))

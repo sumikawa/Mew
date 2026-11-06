@@ -325,7 +325,7 @@ which is then evaluated.  Only global variables are in reach."
           (mew-temp-dir-init)
           (setq first mew-temp-dir)
           (should (file-directory-p first))
-          (should (equal (file-modes first) mew-folder-mode))
+          (should (equal (file-modes first) #o700))
           (should (string-prefix-p mew-temp-file-initial first))
           (should-not (directory-files first nil "\\`[^.]"))
           (should (equal mew-temp-file (expand-file-name "mew" first)))
@@ -334,6 +334,125 @@ which is then evaluated.  Only global variables are in reach."
           (should-not (equal mew-temp-dir first)))
       (remove-hook 'kill-emacs-hook 'mew-temp-dir-clean-up)
       (delete-directory base t))))
+
+(ert-deftest mew-test-temp-dir-init-private ()
+  "The temporary directory stays private when folders are shared."
+  (let* ((base (make-temp-file "mew-test-base" t))
+         (mew-temp-file-initial (expand-file-name "mew" base))
+         (mew-folder-mode #o750)
+         (mew-temp-dir nil)
+         (mew-temp-file nil))
+    (unwind-protect
+        (progn
+          (mew-temp-dir-init)
+          (should (equal (file-modes mew-temp-dir) #o700)))
+      (remove-hook 'kill-emacs-hook 'mew-temp-dir-clean-up)
+      (delete-directory base t))))
+
+(ert-deftest mew-test-make-temp-name-after-removal ()
+  "A directory put where the removed one was is not taken over."
+  (skip-unless (not (eq system-type 'windows-nt)))
+  (let* ((base (make-temp-file "mew-test-base" t))
+         (other (make-temp-file "mew-test-other" t))
+         (mew-temp-file-initial (expand-file-name "mew" base))
+         (mew-temp-dir nil)
+         (mew-temp-file nil)
+         old)
+    (unwind-protect
+        (dolist (squat (list (lambda (d) (make-directory d) (set-file-modes d #o777))
+                             (lambda (d) (make-symbolic-link other d))))
+          (mew-temp-dir-init)
+          (setq old mew-temp-dir)
+          (delete-directory old)
+          (funcall squat old)
+          (should-not (string-prefix-p (file-name-as-directory old)
+                                       (mew-make-temp-name)))
+          (should (mew-temp-dir-ok-p))
+          (if (file-symlink-p old) (delete-file old) (delete-directory old)))
+      (remove-hook 'kill-emacs-hook 'mew-temp-dir-clean-up)
+      (delete-directory base t)
+      (delete-directory other t))))
+
+(ert-deftest mew-test-passwd-save-private ()
+  "The plain text handed to gpg is readable by the user only."
+  (let* ((base (make-temp-file "mew-test-base" t))
+         (mew-temp-file-initial (expand-file-name "mew" base))
+         (mew-conf-path base)
+         (mew-passwd-alist '(("tag" "secret" 0)))
+         (mew-temp-dir nil)
+         (mew-temp-file nil)
+         seen)
+    (unwind-protect
+        (with-file-modes #o644
+          (mew-temp-dir-init)
+          (cl-letf (((symbol-function 'mew-start-process-lang)
+                     (lambda (&rest args)
+                       (setq seen (file-modes (car (last args))))
+                       (error "no gpg here"))))
+            (ignore-errors (mew-passwd-save)))
+          (should (eql seen #o600)))
+      (remove-hook 'kill-emacs-hook 'mew-temp-dir-clean-up)
+      (delete-directory base t))))
+
+(ert-deftest mew-test-passwd-save-cleans-up ()
+  "The plain text is removed even when the first save fails."
+  (let* ((base (make-temp-file "mew-test-base" t))
+         (mew-temp-file-initial (expand-file-name "mew" base))
+         (mew-conf-path base)
+         (mew-passwd-alist '(("tag" "secret" 0)))
+         (mew-temp-dir nil)
+         (mew-temp-file nil)
+         tfile)
+    (unwind-protect
+        (progn
+          (mew-temp-dir-init)
+          (cl-letf (((symbol-function 'mew-start-process-lang)
+                     (lambda (&rest args)
+                       (setq tfile (car (last args)))
+                       (error "no gpg here"))))
+            (ignore-errors (mew-passwd-save)))
+          (should tfile)
+          (should-not (file-exists-p tfile)))
+      (remove-hook 'kill-emacs-hook 'mew-temp-dir-clean-up)
+      (delete-directory base t))))
+
+(ert-deftest mew-test-encode-set-privacy-after-failure ()
+  "After encryption failed, sending again asks before going out as it is."
+  (with-temp-buffer
+    (let ((mew-encode-syntax (mew-encode-syntax-single "text.txt" (list mew-ct-txt)))
+	  asked)
+      (mew-tinfo-set-privacy-err t)
+      (mew-tinfo-set-encode-err "No his/her public key: a@example.org")
+      ;; no
+      (cl-letf (((symbol-function 'y-or-n-p)
+		 (lambda (prompt) (setq asked prompt) nil)))
+	(should-error (mew-encode-set-privacy nil nil nil)))
+      (should (string-match "No his/her public key: a@example.org" asked))
+      (should (equal (mew-tinfo-get-encode-err)
+		     "No his/her public key: a@example.org"))
+      ;; yes: nothing is protected
+      (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) t)))
+	(mew-encode-set-privacy nil nil nil))
+      (should-not (mew-syntax-get-privacy mew-encode-syntax)))))
+
+(ert-deftest mew-test-encode-delete-backup ()
+  "Sending or killing a draft leaves no plain text backup behind."
+  (let* ((dir (make-temp-file "mew-test-draft" t))
+         (draft (expand-file-name "1" dir))
+         (back (expand-file-name "#1" dir))
+         (mdi (concat draft mew-draft-info-suffix)))
+    (unwind-protect
+        (progn
+          (dolist (f (list draft back mdi))
+            (write-region "x" nil f nil 'no-msg))
+          (with-temp-buffer
+            (setq buffer-file-name draft)
+            (mew-encode-delete-backup)
+            (setq buffer-file-name nil))
+          (should (file-exists-p draft))
+          (should-not (file-exists-p back))
+          (should-not (file-exists-p mdi)))
+      (delete-directory dir t))))
 
 (ert-deftest mew-test-temp-dir-init-does-not-reuse ()
   "A directory which is already there must not be taken over.
@@ -1142,6 +1261,19 @@ stay dynamic."
 	(should (fboundp f))
 	(should (equal (funcall f) (concat "<" a ">")))))))
 
+(ert-deftest mew-test-scan-get-piece-bidi ()
+  "A column truncated in the middle of a bidi override must not leave
+it open; that reversed the rest of the summary line (#335)."
+  (let ((from (concat "⁦‮" "【 せ ら 知 お 庁 税 国 】" "‬⁩"))
+	(mew-inherit-total 0)
+	(mew-inherit-width 80)
+	piece)
+    (cl-letf (((symbol-function 'mew-summary-form-from) (lambda () from)))
+      (setq piece (mew-scan-get-piece '(17 from))))
+    (should (= (string-width piece) 17))
+    (should (string-prefix-p "【" piece))
+    (should-not (string-match mew-regex-bidi-control piece))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
 ;;; The tree itself
@@ -1258,6 +1390,16 @@ underscore and a space the wrong way round and matches nothing."
   ;; what Q encoding gave, neither of which Hyper Estraier has
   (should (equal (mew-q-encode-string "Mail_local/" ?%) "Mail%5Flocal/"))
   (should (equal (mew-q-encode-string "Mail dir/" ?%) "Mail_dir/")))
+
+(ert-deftest mew-test-search-switch-notmuch ()
+  "Notmuch has no function to canonicalize a pattern, register or
+unregister a folder, or filter the input."
+  (let ((ent (mew-search-get-ent 'notmuch)))
+    (should (= (length ent) 11))
+    (should-not (mew-search-get-func-canonicalize-pattern ent))
+    (should-not (mew-search-get-func-register ent))
+    (should-not (mew-search-get-func-unregister ent))
+    (should-not (mew-search-get-func-filter ent))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -1447,6 +1589,14 @@ key up, so the recipient is the part which is always there."
     (should (equal (check "[GNUPG:] INV_RECP 4 <a@example.org>\n")
 		   (concat mew-pgp-result-other ": <a@example.org>")))))
 
+(ert-deftest mew-test-pgp-verify-check-text-signer ()
+  "The signer's address is text, not a regexp, for PGP 2."
+  (let ((mew-pgp-ver mew-pgp-ver2)
+	(mew-inherit-decode-signer "a[b@example.org"))
+    (with-temp-buffer
+      (insert "\nGood signature from user \"A <a[b@example.org>\".\n")
+      (should (string-match "\\`Good PGP sign " (mew-pgp-verify-check-text))))))
+
 (ert-deftest mew-test-pgp-sign-check-status ()
   "GnuPG names the key it would not sign with.  The reason code is 9
 whether the key is missing or merely unusable, so the two are told
@@ -1471,6 +1621,172 @@ apart by whether GnuPG says it considered a key at all."
 		   (concat mew-pgp-result-seckey-nousable ": noselfsig@example.org")))
     ;; GnuPG 1 says nothing of this sort, so the old path keeps its say
     (should-not (check "gpg: skipped \"a@example.org\": secret key not available\n"))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; mew-auth.el: passwords over an unencrypted connection
+;;;
+
+(ert-deftest mew-test-auth-cleartext-refused-p ()
+  (let ((mew-auth-cleartext-allowed nil)
+	(mew-config-alist nil))
+    (should (mew-auth-cleartext-refused-p "PLAIN" nil nil))
+    (should (mew-auth-cleartext-refused-p "login" nil nil))
+    (should (mew-auth-cleartext-refused-p "XOAUTH2" nil nil))
+    (should (mew-auth-cleartext-refused-p "AUTHINFO" nil nil))
+    (should-not (mew-auth-cleartext-refused-p "CRAM-MD5" nil nil))
+    (should-not (mew-auth-cleartext-refused-p "PLAIN" t nil))
+    ;; allowed for one case only
+    (let ((mew-config-alist '(("lan" (auth-cleartext-allowed t)))))
+      (should-not (mew-auth-cleartext-refused-p "PLAIN" nil "lan"))
+      (should (mew-auth-cleartext-refused-p "PLAIN" nil "other")))
+    (let ((mew-auth-cleartext-allowed t))
+      (should-not (mew-auth-cleartext-refused-p "PLAIN" nil nil)))))
+
+(defmacro mew-test-with-auth-stubs (&rest body)
+  "Run BODY with the sending side stubbed; `sent' records what happens."
+  `(let ((sent nil)
+	 (mew-auth-cleartext-allowed nil)
+	 (mew-config-alist nil))
+     (cl-letf (((symbol-function 'display-warning) #'ignore)
+	       ((symbol-function 'mew-smtp-command-quit2)
+		(lambda (&rest _) (push 'quit sent)))
+	       ((symbol-function 'mew-smtp-command-auth-plain)
+		(lambda (&rest _) (push 'plain sent)))
+	       ((symbol-function 'mew-smtp-command-auth-cram-md5)
+		(lambda (&rest _) (push 'cram-md5 sent)))
+	       ((symbol-function 'mew-imap-command-logout2)
+		(lambda (&rest _) (push 'logout sent)))
+	       ((symbol-function 'mew-imap-command-login)
+		(lambda (&rest _) (push 'login sent)))
+	       ((symbol-function 'mew-nntp-command-quit2)
+		(lambda (&rest _) (push 'quit sent)))
+	       ((symbol-function 'mew-nntp-message) #'ignore)
+	       ((symbol-function 'mew-nntp-process-send-string)
+		(lambda (&rest _) (push 'authinfo sent))))
+       ,@body)))
+
+(ert-deftest mew-test-auth-cleartext-smtp ()
+  "SMTP stops when only PLAIN is offered without TLS."
+  (let ((pnm "mew-smtp-info-test"))
+    (mew-test-with-auth-stubs
+     (mew-smtp-set-auth-list pnm '("CRAM-MD5" "PLAIN"))
+     (mew-smtp-set-capa pnm '(("AUTH" "PLAIN")))
+     (mew-smtp-set-secure pnm nil)
+     (mew-smtp-command-auth nil pnm)
+     (should (equal sent '(quit)))
+     (should (string-match "needs TLS" (mew-smtp-get-error pnm)))
+     ;; CRAM-MD5 does not send the password
+     (setq sent nil)
+     (mew-smtp-set-capa pnm '(("AUTH" "PLAIN" "CRAM-MD5")))
+     (mew-smtp-command-auth nil pnm)
+     (should (equal sent '(cram-md5)))
+     ;; over TLS
+     (setq sent nil)
+     (mew-smtp-set-capa pnm '(("AUTH" "PLAIN")))
+     (mew-smtp-set-secure pnm t)
+     (mew-smtp-command-auth nil pnm)
+     (should (equal sent '(plain))))))
+
+(ert-deftest mew-test-auth-cleartext-imap-fallback ()
+  "IMAP does not fall back to LOGIN without TLS when AUTH= is gone."
+  (let ((pnm "mew-imap-info-test"))
+    (mew-test-with-auth-stubs
+     (mew-imap-set-auth pnm t)
+     (mew-imap-set-auth-list pnm '("CRAM-MD5"))
+     (mew-imap-set-authl pnm nil)
+     (mew-imap-set-secure pnm nil)
+     (mew-imap-command-authentication nil pnm)
+     (should (equal sent '(logout)))
+     ;; LOGIN chosen by the user is left alone
+     (setq sent nil)
+     (mew-imap-set-auth pnm nil)
+     (mew-imap-command-authentication nil pnm)
+     (should (equal sent '(login))))))
+
+(ert-deftest mew-test-auth-cleartext-nntp ()
+  "NNTP AUTHINFO is not sent without TLS."
+  (let ((pnm "mew-nntp-info-test"))
+    (mew-test-with-auth-stubs
+     (mew-nntp-set-user pnm "user")
+     (mew-nntp-set-secure pnm nil)
+     (mew-nntp-command-authinfo nil pnm)
+     (should (equal sent '(quit)))
+     (setq sent nil)
+     (mew-nntp-set-secure pnm t)
+     (mew-nntp-command-authinfo nil pnm)
+     (should (equal sent '(authinfo))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; mew-bq.el: control characters in parameters
+;;;
+
+(ert-deftest mew-test-param-decode-ctl ()
+  "No control character survives in a parameter value."
+  (let ((mew-decode-broken t))
+    (dolist (hdr '("message/external-body; site=\"=?us-ascii?Q?x=0A!id?=\""
+		   "message/external-body; site*=us-ascii''x%0A%21id"))
+      (should (equal (mew-syntax-get-param (cdr (mew-param-decode hdr)) "site")
+		     "x!id")))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; mew-ext.el: URL of message/external-body
+;;;
+
+(ert-deftest mew-test-ext-url-valid ()
+  "Only http, https and ftp URLs go to the browser."
+  (require 'mew-ext)
+  (should (equal (mew-ext-url-valid "https://www.example.org/a?b=c")
+		 "https://www.example.org/a?b=c"))
+  (should (equal (mew-ext-url-valid "ftp://ftp.example.org/pub/a.tgz")
+		 "ftp://ftp.example.org/pub/a.tgz"))
+  ;; RFC 2017: white space is ignored
+  (should (equal (mew-ext-url-valid "http://www.example.org/very/\n long")
+		 "http://www.example.org/very/long"))
+  (should-not (mew-ext-url-valid "-aCalculator"))
+  (should-not (mew-ext-url-valid "file:///Applications/Calculator.app"))
+  (should-not (mew-ext-url-valid "/Applications/Calculator.app"))
+  (should-not (mew-ext-url-valid "C:\\Windows\\System32\\calc.exe"))
+  (should-not (mew-ext-url-valid "http://x/\e[31m"))
+  (should-not (mew-ext-url-valid nil)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; mew-smime.el: verification
+;;;
+
+;; The output below was taken from gpgsm 2.5.21 with a self-signed
+;; certificate whose CN was chosen by the signer.
+
+(ert-deftest mew-test-smime-verify-check ()
+  "Only status lines count; the signer's DN must not change the result."
+  (cl-flet ((check (out)
+	      (with-temp-buffer
+		(insert out)
+		(mew-smime-verify-check))))
+    ;; the message was changed after it was signed
+    (should (equal (check "\
+[GNUPG:] NEWSIG
+gpgsm: Signature made 2026-11-01 21:56:18 UTC
+gpgsm: invalid signature: message digest attribute does not match computed one
+[GNUPG:] BADSIG 51643A25B9281020EB27675C062A72D3F906AEA4 /CN=Mallory GOODSIG TRUST_FULLY/EMail=ceo@bank.example
+[GNUPG:] FAILURE gpgsm-exit 50331649
+")
+		   "BAD S/MIME sign \"/CN=Mallory GOODSIG TRUST_FULLY/EMail=ceo@bank.example\""))
+    ;; a good signature from a certificate nobody vouches for
+    (should (equal (check "\
+[GNUPG:] NEWSIG
+[GNUPG:] GOODSIG 51643A25B9281020EB27675C062A72D3F906AEA4 /CN=Mallory GOODSIG TRUST_FULLY/EMail=ceo@bank.example
+[GNUPG:] VALIDSIG 51643A25B9281020EB27675C062A72D3F906AEA4 2026-11-01 20261101T215618 20261201T215618 0 0 1 8 00
+gpgsm: invalid certification chain: No agent running
+[GNUPG:] TRUST_UNDEFINED 77
+")
+		   "Good S/MIME sign \"/CN=Mallory GOODSIG TRUST_FULLY/EMail=ceo@bank.example\" UNDEFINED"))
+    ;; no status at all
+    (should (equal (check "gpgsm: GOODSIG TRUST_FULLY EMail=x@example.org\n")
+		   "BAD S/MIME sign"))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -1522,6 +1838,46 @@ apart by whether GnuPG says it considered a key at all."
 	      (wr s 'ctext-unix)
 	      (should (equal (rd) s))))
 	(delete-file file)))))
+
+(ert-deftest mew-test-cs-m17n-invalid-bytes ()
+  "A UTF-8 file with a few invalid bytes is not read as ctext."
+  (let ((file (make-temp-file "mew-test")))
+    (unwind-protect
+	(progn
+	  (with-temp-file file
+	    (set-buffer-multibyte nil)
+	    (insert (encode-coding-string "漢字 " 'utf-8-unix) "\xc8\x7e\n"))
+	  (with-temp-buffer
+	    (let ((coding-system-for-read mew-cs-m17n))
+	      (insert-file-contents file))
+	    (should (equal (buffer-substring 1 4) "漢字 "))
+	    (should (eq (char-after 4) #x3fffc8))))
+      (delete-file file))))
+
+(ert-deftest mew-test-cs-m17n-raw-bytes ()
+  "Raw bytes are written as U+FFFD, even next to read-only text."
+  (let ((file (make-temp-file "mew-test"))
+	(coding-system-for-write mew-cs-m17n))
+    (unwind-protect
+	(progn
+	  (should (equal (encode-coding-string
+			  (concat "漢字 " (string #x3fffc8) "~") mew-cs-m17n)
+			 (encode-coding-string "漢字 \ufffd~" 'utf-8-unix)))
+	  ;; A draft has read-only text.
+	  (with-temp-buffer
+	    (insert "a\n" (propertize "----\n" 'read-only t))
+	    (write-region nil nil file nil 'silent))
+	  (with-temp-buffer
+	    (insert "b\n")
+	    (write-region nil nil file nil 'silent)))
+      (delete-file file))))
+
+(ert-deftest mew-test-charset-gb2312 ()
+  "GB2312 is decoded as GBK, and cn-gb-2312 is still named GB2312."
+  (should (equal (mew-header-decode "gb2312" "B" "x6fIfrmktPOhobyazO+9zMra")
+		 "千葉工大　細田教授"))
+  (should (equal (mew-cs-to-charset 'cn-gb-2312) "gb2312"))
+  (should (equal (mew-cs-to-charset 'gbk) "gbk")))
 
 (ert-deftest mew-test-lisp-save-load-emoji ()
   "Lisp data files keep characters that ctext cannot hold."
@@ -1612,6 +1968,22 @@ apart by whether GnuPG says it considered a key at all."
       (should (pass own-pass '("MX.example.net")))
       (should-not (pass "")))))
 
+(ert-deftest mew-test-bimi-pass-p-decoded ()
+  "The topmost Authentication-Results: counts even after it is moved."
+  (mew-regex-setup) ;; mew-eoh
+  (cl-flet ((pass (hdr)
+	      (with-temp-buffer
+		(insert hdr "Subject: s\n\nbody\n")
+		(goto-char (point-min))
+		(mew-decode-rfc822-header)
+		(goto-char (point-min))
+		(and (mew-bimi-pass-p) t))))
+    ;; A field with "=softfail" is visible and moved below the others.
+    (should (pass (concat "Authentication-Results: own; sender-id=softfail; bimi=pass\n"
+			  "Authentication-Results: relay; dkim=pass\n")))
+    (should-not (pass (concat "Authentication-Results: own; dkim=fail\n"
+			      "Authentication-Results: forged; bimi=pass\n")))))
+
 (ert-deftest mew-test-debug-redact ()
   "Credentials do not reach the debug buffer; other commands do."
   (dolist (c '(("PASS secret" . "PASS ********")
@@ -1622,6 +1994,26 @@ apart by whether GnuPG says it considered a key at all."
 	       ("AUTH LOGIN" . "AUTH LOGIN") ("STARTTLS" . "STARTTLS")
 	       ("USER kazu" . "USER kazu") ("RETR 3" . "RETR 3")))
     (should (equal (mew-debug-redact (car c)) (cdr c)))))
+
+(ert-deftest mew-test-mewl-pattern-args ()
+  "On Windows, a non-ASCII pick pattern goes to mewl in hex."
+  (let ((system-type 'windows-nt))
+    (should (equal (mew-mewl-pattern-args "subject=日本")
+		   '("-P" "7375626a6563743de697a5e69cac")))
+    (should (equal (mew-mewl-pattern-args "from=kazu") '("-p" "from=kazu"))))
+  (let ((system-type 'gnu/linux))
+    (should (equal (mew-mewl-pattern-args "subject=日本")
+		   (list "-p" (encode-coding-string "subject=日本" 'utf-8))))))
+
+(ert-deftest mew-test-delete-images ()
+  "Images such as X-Face: are not printed as blanks."
+  (with-temp-buffer
+    (let ((img '(image :type xbm :data "")))
+      (insert "From:" (propertize " " 'display img) " kazu\n"
+	      (propertize "x" 'display "y") "\n"
+	      (propertize "  " 'display img)))
+    (mew-delete-images)
+    (should (equal (buffer-string) "From: kazu\nx\n"))))
 
 (provide 'mew-test)
 
