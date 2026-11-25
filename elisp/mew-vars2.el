@@ -289,11 +289,12 @@ in draft buffer.")
   "\\<mew-summary-mode-map>Database for MIME content type.
 This is a list of entries which consist of <content-type>,
 <regular expression of file suffix>, <content-transfer-encoding>,
-<symbol for visualizer>, <symbol for icon>, <auxiliary data>.
+<symbol for visualizer>, <unused (was a symbol for icon)>,
+<auxiliary data>.
 
 Here is an example:
 
-	(\"image/png\" \"\\\\.png$\" mew-b64 mew-prog-image mew-icon-image png)
+	(\"image/png\" \"\\\\.png$\" mew-b64 mew-prog-image nil png)
 
 This database is used both when visualizing and composing. For
 example, when visualizing, a visualizer is chosen according to
@@ -375,9 +376,6 @@ the next version of Mew.")
     (if (and (listp val) (eq 'if (car val)))
 	(eval val)
       val)))
-
-(defun mew-ctdb-icon (attr)
-  (symbol-value (nth 4 attr)))
 
 (defun mew-mime-image-format-name (ct)
   (nth 5 (mew-ctdb-by-ct ct)))
@@ -623,10 +621,10 @@ present, mew-face-header-marginal is used."
 	(face-val (intern (concat "mew-face-color-" val-color (if bold "-bold")))))
     (unless (facep face-key)
       (make-empty-face face-key)
-      (face-spec-set face-key (list (mew-face-spec-func t (mew-face-spec-primitive key-color bold)))))
+      (face-spec-set face-key (list (cons t (mew-face-spec-primitive key-color bold)))))
     (unless (facep face-val)
       (make-empty-face face-val)
-      (face-spec-set face-val (list (mew-face-spec-func t (mew-face-spec-primitive val-color bold)))))
+      (face-spec-set face-val (list (cons t (mew-face-spec-primitive val-color bold)))))
     (setq mew-header-color-alist
 	  (cons (list (capitalize field) face-key face-val) mew-header-color-alist))))
 
@@ -871,9 +869,6 @@ to messages and puts them to your mailbox, configure as follows:
 
 (defun mew-proto-to-go (fld)
   (mew-proto-to-body fld 1))
-
-(defun mew-proto-to-refile (fld)
-  (mew-proto-to-body fld 2))
 
 (defun mew-proto-to-flush (fld)
   (mew-proto-to-body fld 3))

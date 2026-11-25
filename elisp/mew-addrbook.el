@@ -62,9 +62,6 @@
 (defun mew-addrbook-shortname-get (addr)
   (mew-adbkent-shortname (mew-adbkent-by-addr addr)))
 
-(defun mew-addrbook-addrs-get (addr)
-  (mew-adbkent-addrs (mew-adbkent-by-addr addr)))
-
 (defun mew-addrbook-nickname-get (addr)
   (mew-adbkent-nickname (mew-adbkent-by-addr2 addr)))
 
@@ -81,9 +78,6 @@
 
 (defun mew-autoent-by-shortname (user)
   (assoc user mew-alias-auto-alist))
-
-(defun mew-autoent-shortname (autoent)
-  (nth 0 autoent))
 
 (defun mew-autoent-addr (autoent)
   (nth 1 autoent))
@@ -233,14 +227,6 @@ returned."
   ;; This produces a different alist made by mew-addrbook-setup.
   ;; But we do not care.
   (setq mew-addrbook-alist (cons user-addr mew-addrbook-alist)))
-
-(defun mew-addrbook-alias-delete (addr)
-  (when (and (stringp addr) (string-match "@" addr))
-    (let* ((user (downcase (mew-addrstr-extract-user addr)))
-	   (ent (mew-autoent-by-shortname user)))
-      (when (and ent (string= addr (mew-autoent-addr addr)))
-	(setq mew-addrbook-alist (delete ent mew-addrbook-alist))
-	(setq mew-alias-auto-alist (delq ent mew-alias-auto-alist))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -423,7 +409,7 @@ it will add an alias."
   (setq mode-name mname)
   (setq mode-line-buffer-identification (mew-mode-line-id))
   (use-local-map mew-addrbook-mode-map)
-  (mew-run-mode-hooks 'mew-addrbook-mode-hook)
+  (run-mode-hooks 'mew-addrbook-mode-hook)
   (setq buffer-undo-list nil))
 
 (defun mew-addrbook-nconc (ent)

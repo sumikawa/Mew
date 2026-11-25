@@ -51,48 +51,39 @@
 ;;(setq mew-oauth2-token-url "https://login.microsoftonline.com/organizations/oauth2/v2.0/token")
 ;;(setq mew-oauth2-resource-url "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/POP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access")
 
-(defun mew-oauth2-debug (label string)
-  (when (mew-debug 'oauth2)
-    (with-current-buffer (get-buffer-create mew-buffer-debug)
-      (goto-char (point-max))
-      (let ((start (point)))
-	(insert (format "\n<%s>\n%s\n" label string))
-	(goto-char start)
-	(mew-crlf-to-lf))
-      (goto-char (point-max)))))
-
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
 ;;; HTTP/1.1 server to get "code"
 ;;;
 
-(defvar mew-oauth2-code nil)
-
 ;; The redirect handler listens on localhost, so anything which can
 ;; reach that port, a page in the browser for instance, can send us an
 ;; authorization code of its own.  The state we generate here is what
 ;; tells the real redirect from such an injection.  RFC 6749 10.12.
-(defvar mew-oauth2-state nil)
+;; The state and the code live in the plist of the listening process,
+;; which accepted connections inherit.
 
-(defun mew-oauth2-setup-redirect-handler (port)
-  "Setup OAuth2 redirect server bound to PORT.
-It serves http://localhost:PORT"
-  (setq mew-oauth2-code nil)
-  (let ((proc-name (format "oauth2-redirect-handler:%d" port)))
-    (unless (process-status proc-name)
-      (make-network-process
-       :name proc-name
-       :buffer nil
-       :host 'local
-       :service port
-       :sentinel 'mew-oauth2-redirect-handler-sentinel
-       :filter 'mew-oauth2-redirect-handler-filter
-       :server t))))
+(defun mew-oauth2-redirect-handler-name (port)
+  (format "oauth2-redirect-handler:%d" port))
+
+(defun mew-oauth2-setup-redirect-handler (port state)
+  "Setup OAuth2 redirect server bound to PORT and return it.
+It serves http://localhost:PORT and accepts a code with STATE only."
+  (let ((server (make-network-process
+		 :name (mew-oauth2-redirect-handler-name port)
+		 :buffer nil
+		 :host 'local
+		 :service port
+		 :sentinel 'mew-oauth2-redirect-handler-sentinel
+		 :filter 'mew-oauth2-redirect-handler-filter
+		 :server t)))
+    (process-put server 'mew-oauth2-server server)
+    (process-put server 'mew-oauth2-state state)
+    server))
 
 (defun mew-oauth2-cleanup-redirect-handler (port)
   "Clean up OAuth2 redirect servers both LISTEN and ACCEPT."
-  (let ((proc-name (format "oauth2-redirect-handler:%d" port)))
+  (let ((proc-name (mew-oauth2-redirect-handler-name port)))
     (mapcar (lambda (p)
               (if (string= (process-contact p :name) proc-name)
                   (delete-process p)))
@@ -126,20 +117,21 @@ It serves http://localhost:PORT"
     (let* ((request (mew-match-string 1 string))
 	   (code (mew-oauth2-query-get request "code"))
 	   (err (mew-oauth2-query-get request "error"))
-	   (state (mew-oauth2-query-get request "state")))
+	   (state (mew-oauth2-query-get request "state"))
+	   (our-state (process-get proc 'mew-oauth2-state))
+	   (server (process-get proc 'mew-oauth2-server)))
       (cond
-       ((and err (null code) (stringp mew-oauth2-state)
-	     (equal state mew-oauth2-state))
+       ((and err (null code) (stringp our-state) (equal state our-state))
 	;; The user denied it, for instance: stop waiting.
 	(mew-oauth2-respond
 	 proc "200 OK" (concat "Mew was not authorized: " err "\n"))
 	(message "OAuth2: not authorized (%s)" err)
-	(setq mew-oauth2-code ""))
+	(process-put server 'mew-oauth2-code ""))
        ((null code)
 	()) ;; not the redirect we are waiting for
-       ((not (and (stringp mew-oauth2-state)
+       ((not (and (stringp our-state)
 		  (stringp state)
-		  (string= state mew-oauth2-state)))
+		  (string= state our-state)))
 	(mew-oauth2-respond
 	 proc "400 Bad Request"
 	 "Mew did not ask for this authorization code.\n"))
@@ -147,7 +139,7 @@ It serves http://localhost:PORT"
 	(mew-oauth2-respond
 	 proc "200 OK"
 	 (concat "Mew gets the following authorization code:\n" code "\n"))
-	(setq mew-oauth2-code code))))))
+	(process-put server 'mew-oauth2-code code))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -155,30 +147,35 @@ It serves http://localhost:PORT"
 ;;;
 
 (defun mew-oauth2-get-auth-code (url client-id resource-url redirect-url challenge port)
-  (setq mew-oauth2-state (mew-oauth2-random-string))
-  (let ((url-params
-	 (concat
-	  url
-	  "?response_type=code"
-	  "&client_id=" client-id
-	  "&scope=" (url-hexify-string resource-url)
-	  "&redirect_uri=" (url-hexify-string redirect-url)
-	  "&state=" mew-oauth2-state
-	  "&code_challenge=" challenge
-	  "&code_challenge_method=S256")))
-    (mew-oauth2-cleanup-redirect-handler port)
-    ;; The listening socket has to go even when the user gives up, or
-    ;; the port stays taken for the rest of the session.
-    (unwind-protect
-	(condition-case nil
-	    (progn
-	      (mew-oauth2-setup-redirect-handler port)
-	      (browse-url url-params)
-	      (mew-rendezvous (null mew-oauth2-code))
-	      mew-oauth2-code)
-	  (error "")
-	  (quit ""))
-      (mew-oauth2-cleanup-redirect-handler port))))
+  ;; Timers and filters of other connections run while we wait for the
+  ;; browser, so another authorization may start inside this one.
+  ;; Only one at a time can listen on PORT.
+  (if (process-status (mew-oauth2-redirect-handler-name port))
+      (progn
+	(message "OAuth2: another authorization is in progress")
+	"")
+    (let* ((state (mew-oauth2-random-string))
+	   (url-params
+	    (concat
+	     url
+	     "?response_type=code"
+	     "&client_id=" (url-hexify-string client-id)
+	     "&scope=" (url-hexify-string resource-url)
+	     "&redirect_uri=" (url-hexify-string redirect-url)
+	     "&state=" state
+	     "&code_challenge=" challenge
+	     "&code_challenge_method=S256")))
+      ;; The listening socket has to go even when the user gives up, or
+      ;; the port stays taken for the rest of the session.
+      (unwind-protect
+	  (condition-case err
+	      (let ((server (mew-oauth2-setup-redirect-handler port state)))
+		(browse-url url-params)
+		(mew-rendezvous (null (process-get server 'mew-oauth2-code)))
+		(process-get server 'mew-oauth2-code))
+	    (error (message "OAuth2: %s" (error-message-string err)) "")
+	    (quit (message "OAuth2: the authorization was canceled") ""))
+	(mew-oauth2-cleanup-redirect-handler port)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -255,28 +252,20 @@ which does not exist."
 ;;; Interface
 ;;;
 
-(defun mew-xoauth2-json-status (status-string)
-  ;; https://developers.google.com/gmail/imap/xoauth2-protocol#error_response_2
-  (let ((json-status
-         (ignore-errors
-           (json-read-from-string
-            (base64-decode-string status-string)))))
-    ;; The status may be a number as well as a string, and it may not
-    ;; be there at all.
-    (let ((status (and (listp json-status) (cdr (assoc 'status json-status)))))
-      (cond
-       ((null status) "OK") ;; XXX: Maybe OK if not JSON.
-       ((string-match "^2" (format "%s" status)) "OK") ;; 2XX
-       (t "NO"))))) ;; XXX: Anyway NO?
-
 (defun mew-xoauth2-auth-string (user tag case)
+  ;; Without the password file loaded, a new authorization would start.
+  (unless (mew-passwd-loading-p)
+    (mew-xoauth2-auth-string1 user tag case)))
+
+(defun mew-xoauth2-auth-string1 (user tag case)
   (mew-passwd-setup-master)
   (let* ((tk (mew-passwd-get-passwd tag))
          (token (if (hash-table-p tk) tk (make-hash-table)))
          (access-token (mew-xoauth2-get-access-token token case)))
     (mew-passwd-set-passwd tag token)
     (mew-passwd-set-counter tag 0)
-    (when mew-passwd-master
+    ;; Save only a new token: gpg runs synchronously on each save.
+    (when (and mew-passwd-master (gethash :fresh token))
       (mew-passwd-save))
     ;; base64(user=user@example.com^Aauth=Bearer ya29vF9dft4...^A^A)
     (if access-token
@@ -292,10 +281,13 @@ The refresh token is kept only when the answer carries one, since the
 server does not repeat it on every refresh."
   (let ((access-token (gethash "access_token" json))
 	(refresh-token (gethash "refresh_token" json))
-	(expires-in (gethash "expires_in" json)))
+	;; Some servers give a string, e.g. "3599".
+	(expires-in (let ((e (gethash "expires_in" json)))
+		      (if (stringp e) (string-to-number e) e))))
     (puthash :access_token access-token token)
     (if refresh-token (puthash :refresh_token refresh-token token))
-    (puthash :expire (if expires-in (time-add (- expires-in 100) nil)) token)
+    (puthash :expire (if (numberp expires-in) (time-add (- expires-in 100) nil)) token)
+    (puthash :fresh t token)
     access-token))
 
 (defun mew-xoauth2-refresh (token case)
@@ -327,36 +319,45 @@ that case, so that the refresh token is not thrown away."
 		     (mew-oauth2-redirect-url case)
 		     challenge
 		     (mew-oauth2-redirect-port case)))
-	 (json (mew-oauth2-get-access-token
-		(mew-oauth2-token-url case)
-		(mew-oauth2-client-id case)
-		(mew-oauth2-client-secret case)
-		(mew-oauth2-redirect-url case)
-		auth-code
-		verifier)))
-    (if (and json (gethash "access_token" json))
-	(mew-xoauth2-store token json)
+	 ;; "" if canceled, denied or failed, which is already reported
+	 (json (unless (string= auth-code "")
+		 (mew-oauth2-get-access-token
+		  (mew-oauth2-token-url case)
+		  (mew-oauth2-client-id case)
+		  (mew-oauth2-client-secret case)
+		  (mew-oauth2-redirect-url case)
+		  auth-code
+		  verifier))))
+    (cond
+     ((string= auth-code "") nil)
+     ((and json (gethash "access_token" json))
+      (mew-xoauth2-store token json))
+     (t
       (message "OAuth2: no access token was given")
-      nil)))
+      nil))))
 
 (defun mew-xoauth2-get-access-token (token case)
   (let ((access-token (gethash :access_token token))
 	(expire (gethash :expire token)))
-    (if (and access-token expire (time-less-p nil expire))
-	access-token
+    (cond
+     ((and access-token expire (time-less-p nil expire))
+      (puthash :fresh nil token)
+      access-token)
+     ;; Otherwise the browser shows an error and Mew waits until C-g.
+     ((member (mew-oauth2-client-id case) '(nil ""))
+      (message "OAuth2: mew-oauth2-client-id is not set")
+      nil)
+     (t
       ;; A refused refresh token is not the end: ask for a new
       ;; authorization instead of going on without a token.
       (or (mew-xoauth2-refresh token case)
-	  (mew-xoauth2-authorize token case)))))
+	  (mew-xoauth2-authorize token case))))))
 ;;;
 
 ;; RFC 7636 Appendix A
 
-(defun mew-numlist-to-string (nums)
-  (apply 'concat (seq-map 'unibyte-string nums)))
-
 ;; (mew-base64-url-without-padding-encode
-;;  (mew-numlist-to-string '(3 236 255 224 193)))
+;;  (apply #'unibyte-string '(3 236 255 224 193)))
 ;; "A-z_4ME"
 (defun mew-base64-url-without-padding-encode (str)
   (base64url-encode-string str t))
@@ -370,7 +371,7 @@ that case, so that the refresh token is not thrown away."
 
 ;; (setq rfc7636-random32 '(116 24 223 180 151 153 224 37 79 250 96 125 216 173 187 186 22 212 37 77 105 214 191 240 91 88 5 88 83 132 141 121))
 ;; (setq rfc7636-verifier (mew-base64-url-without-padding-encode
-;; 			(mew-numlist-to-string rfc7636-random32)))
+;; 			(apply #'unibyte-string rfc7636-random32)))
 ;; "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 (defun mew-oauth2-pkce-code-verifier ()
   (mew-oauth2-random-string))

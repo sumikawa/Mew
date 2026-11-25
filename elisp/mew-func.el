@@ -232,11 +232,6 @@ to the list itself."
 	    (throw 'loop (cons i a)))
 	(setq i (1+ i))))))
 
-(defun mew-assoc-member (key lol nth)
-  "Return a list member of LoL whose NTH list contains
-a member equal to KEY."
-  (mew-assoc-member-base key lol nth 'member))
-
 (defun mew-assoc-member-case-equal (key lol nth)
   "Return a list member of LoL whose NTH list contains
 a member equal to KEY ignoring case."
@@ -332,6 +327,18 @@ in the context of FUNC."
 (defun mew-make-string (len)
   (make-string len ?a))
 
+(defun mew-chars-to-string (chars)
+  "Make a string of CHARS as `aset' into a unibyte string did.
+Characters below 256 are bytes unless some other is not.  Emacs 31
+signals an error for `aset' of a character which is not a byte."
+  (if (memq t (mapcar (lambda (c) (>= c 256)) chars))
+      (apply #'string (mapcar (lambda (c)
+				(if (and (>= c 128) (< c 256))
+				    (unibyte-char-to-multibyte c)
+				  c))
+			      chars))
+    (apply #'unibyte-string chars)))
+
 (defun mew-replace-character (string from to)
   "Replace characters equal to FROM to TO in STRING."
   (subst-char-in-string from to string))
@@ -365,21 +372,19 @@ rest of the line."
 (defun mew-capitalize (ostr)
   "Syntax table independent version of capitalize.
 Words are separated by '/' and '-'."
-  (let* ((len (length ostr))
-	 (nstr (mew-make-string len))
-	 (topp t) c)
-    (dotimes (i len)
-      (setq c (aref ostr i))
-      (cond
-       (topp
-	(aset nstr i (upcase c))
-	(setq topp nil))
-       ((or (char-equal c ?/) (char-equal c ?-))
-	(aset nstr i c)
-	(setq topp t))
-       (t
-	(aset nstr i (downcase c)))))
-    nstr))
+  (let ((topp t))
+    (mew-chars-to-string
+     (mapcar (lambda (c)
+	       (cond
+		(topp
+		 (setq topp nil)
+		 (upcase c))
+		((or (char-equal c ?/) (char-equal c ?-))
+		 (setq topp t)
+		 c)
+		(t
+		 (downcase c))))
+	     (string-to-list ostr)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -498,17 +503,10 @@ also ignored."
 
 (defun mew-quote-string (str qchar targets)
   "If characters in STR is a member of TARGETS, QCHAR is prepended to them."
-  (let* ((len (length str))
-	 (ret (mew-make-string (* len 2)))
-	 (j 0) c)
-    (dotimes (i len)
-      (setq c (aref str i))
-      (when (member c targets)
-	(aset ret j qchar)
-	(setq j (1+ j)))
-      (aset ret j c)
-      (setq j (1+ j)))
-    (substring ret 0 j)))
+  (mew-chars-to-string
+   (apply #'append
+	  (mapcar (lambda (c) (if (member c targets) (list qchar c) (list c)))
+		  (string-to-list str)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -632,11 +630,6 @@ If case is \"default\", it is not prepended."
     (mew-vinfo-get-physical-folder))))
 
 ;;
-
-(defun mew-local-to-dir (folder)
-  (if (string-match "^[+]" folder)
-      (substring folder 1)
-    folder))
 
 ;;
 
@@ -1003,11 +996,6 @@ Does not examine containing directories for links."
     (while (setq exp (file-symlink-p ret))
       (setq ret (expand-file-name exp (file-name-directory ret))))
     ret))
-
-(defun mew-file-from-home (str)
-  (if (string-match (expand-file-name mew-home) str)
-      (concat mew-home (substring str (match-end 0)))
-    str))
 
 (defun mew-prepend-prefix (file prefix)
   (if (file-name-absolute-p file)
@@ -1393,9 +1381,6 @@ PRO is killed if it is still alive by then."
     (while (< i len)
       (aset vec i nil)
       (setq i (1+ i)))))
-
-(defun mew-net-get-ssh-process (pnm)
-  (aref (mew-info pnm) 3))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;

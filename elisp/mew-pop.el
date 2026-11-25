@@ -45,7 +45,8 @@
   '(("greeting"      nil ("\\+OK" . "capa"))
     ("capa"          t   ("\\+OK" . "auth") ("-ERR" . "pswd"))
     ("auth-xoauth2"  nil ("\\+OK" . "token-xoauth2") ("-ERR" . "wpwd"))
-    ("token-xoauth2" nil ("\\+OK" . "list") ("-ERR" . "wpwd"))
+    ("token-xoauth2" nil ("\\+OK" . "list") ("challenge" . "xoauth2-error") ("-ERR" . "wpwd"))
+    ("xoauth2-error" nil ("\\+OK" . "wpwd") ("-ERR" . "wpwd"))
     ("auth-cram-md5" nil ("\\+OK" . "pwd-cram-md5") ("-ERR" . "wpwd"))
     ("pwd-cram-md5"  nil ("\\+OK" . "list") ("-ERR" . "wpwd"))
     ("auth-plain"    nil ("\\+OK" . "pwd-plain") ("-ERR" . "wpwd"))
@@ -180,7 +181,7 @@
      (t
       ;; pnm may be cleared already
       (mew-pop-message pnm "POP password is wrong!")))
-    (if clear-pass (mew-passwd-set-passwd (mew-pop-passtag pnm) nil))
+    (if clear-pass (mew-passwd-forget-passwd (mew-pop-passtag pnm)))
     (if (eq directive 'exec)
 	(mew-summary-visible-buffer bnm))
     (mew-pop-command-quit2 pro pnm)))
@@ -537,6 +538,11 @@
          (auth-string (mew-xoauth2-auth-string user tag (mew-pop-get-case pnm))))
     (mew-pop-process-send-string pro "%s" auth-string)))
 
+(defun mew-pop-command-xoauth2-error (pro _pnm)
+  ;; Gmail refuses the token with a challenge carrying an error JSON.
+  ;; An empty response makes the server answer with -ERR.
+  (mew-pop-process-send-string pro ""))
+
 (defun mew-pop-command-auth-cram-md5 (pro pnm)
   (mew-pop-process-send-string pro "AUTH CRAM-MD5")
   (mew-pop-set-status pnm "auth-cram-md5"))
@@ -791,7 +797,7 @@
 	(set-process-sentinel process 'mew-pop-sentinel)
 	(set-process-filter process 'mew-pop-filter)
 	(set-process-buffer process buf)
-	(when (and gnutlsp starttlsp)
+	(when gnutlsp
 	  (let ((greeting (plist-get (cdr pro-plist) :greeting)))
 	    (if (stringp greeting) (mew-pop-filter process greeting))))))))
 
@@ -836,7 +842,14 @@
 		(and (not mulrep)
 		     (goto-char (1- (point-max)))
 		     (looking-at "\n$"))))
-       (setq next (mew-pop-fsm-next status "+OK")))
+       (setq next (mew-pop-fsm-next
+		   status
+		   ;; After the XOAUTH2 token, "+ " is an error challenge.
+		   (if (and (string= status "token-xoauth2")
+			    (not (progn (goto-char (point-min))
+					(looking-at "\\+OK"))))
+		       "challenge"
+		     "+OK"))))
       (t
        (setq stay t)))
      (unless stay
@@ -853,6 +866,7 @@
 (defun mew-pop-sentinel (process event)
   (let* ((pnm (process-name process))
 	 (directive (mew-pop-get-directive pnm))
+	 (case (mew-pop-get-case pnm))
 	 (mdb (mew-pop-get-mdb pnm))
 	 (sshpro (mew-pop-get-ssh-process pnm))
 	 (sslpro (mew-pop-get-ssl-process pnm))
@@ -975,7 +989,7 @@
 	(run-hooks 'mew-pop-sentinel-non-biff-hook))
       (run-hooks 'mew-pop-sentinel-hook)
       (when (and mew-auto-flush-queue flush)
-	(mew-smtp-flush-queue mew-case)))))
+	(mew-smtp-flush-queue case)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;

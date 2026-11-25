@@ -63,11 +63,14 @@ character."
 
 (ert-deftest mew-test-capitalize ()
   (should (equal (mew-capitalize "content-type") "Content-Type"))
-  (should (equal (mew-capitalize "TEXT/PLAIN") "Text/Plain")))
+  (should (equal (mew-capitalize "TEXT/PLAIN") "Text/Plain"))
+  ;; Emacs 31 signals an error for aset of a non-byte into a string.
+  (should (equal (mew-capitalize "件名-x") "件名-X")))
 
 (ert-deftest mew-test-quote-string ()
   (should (equal (mew-quote-string "a\"b" ?\\ '(?\")) "a\\\"b"))
-  (should (equal (mew-quote-string "ab" ?\\ '(?\")) "ab")))
+  (should (equal (mew-quote-string "ab" ?\\ '(?\")) "ab"))
+  (should (equal (mew-quote-string "山\"本" ?\\ '(?\")) "山\\\"本")))
 
 (ert-deftest mew-test-remove-single-quote ()
   "Both branches are covered: `string-replace' from Emacs 28.1, and
@@ -268,7 +271,11 @@ which is then evaluated.  Only global variables are in reach."
   (should (equal (mew-q-encode-string "a b=c?") "a_b=3Dc=3F"))
   (should (equal (mew-q-decode-string "a_b=3Dc=3F") "a b=c?"))
   ;; Broken input gives nil instead of an error.
-  (should-not (mew-q-decode-string "=ZZ")))
+  (should-not (mew-q-decode-string "=ZZ"))
+  ;; Decoded bytes stay bytes; a raw byte in the input is kept.
+  (should (equal (mew-q-decode-string "caf=E9") "caf\351"))
+  (should (equal (mew-q-decode-string (concat (string-to-multibyte "\351") "=41"))
+		 (concat (string-to-multibyte "\351") "A"))))
 
 (ert-deftest mew-test-header-encode-decode ()
   (let ((encoded (car (mew-header-encode-string "日本語"))))
@@ -652,40 +659,58 @@ The output arrives through a pty now, so it ends with CR."
   ;; The key must not match a suffix of another key.
   (should-not (mew-oauth2-query-get "/?scope=x" "ope")))
 
-(defun mew-test-oauth2-redirect (request)
-  "Feed REQUEST to `mew-oauth2-redirect-handler-filter'.
-Return a cons of `mew-oauth2-code' afterwards and the status line of
-the reply, or nil when nothing was replied."
-  (let ((sent nil))
-    (setq mew-oauth2-code nil)
-    (cl-letf (((symbol-function 'process-send-string)
-               (lambda (_proc str) (setq sent (car (split-string str "\r\n")))))
-              ((symbol-function 'delete-process) #'ignore))
-      (mew-oauth2-redirect-handler-filter nil request))
-    (cons mew-oauth2-code sent)))
+(defun mew-test-free-ports (n)
+  "Return N distinct TCP ports on localhost which nobody listens on.
+All are held open until the last is taken, or the system may hand out
+a port just closed again."
+  (let ((procs (mapcar (lambda (_)
+                         (make-network-process :name "mew-test-port" :host 'local
+                                               :service t :server t))
+                       (number-sequence 1 n))))
+    (prog1 (mapcar (lambda (p) (process-contact p :service)) procs)
+      (mapc #'delete-process procs))))
+
+(defun mew-test-free-port ()
+  "Return a TCP port on localhost which nobody listens on."
+  (car (mew-test-free-ports 1)))
+
+(defun mew-test-oauth2-redirect (state request)
+  "Feed REQUEST to `mew-oauth2-redirect-handler-filter' of a handler
+waiting with STATE.  Return a cons of the code it got and the status
+line of the reply, or nil when nothing was replied."
+  (let ((port (mew-test-free-port))
+        (sent nil))
+    (unwind-protect
+        (let ((server (mew-oauth2-setup-redirect-handler port state)))
+          (cl-letf (((symbol-function 'process-send-string)
+                     (lambda (_proc str) (setq sent (car (split-string str "\r\n")))))
+                    ((symbol-function 'delete-process) #'ignore))
+            ;; An accepted connection has the same plist as the server.
+            (mew-oauth2-redirect-handler-filter server request))
+          (cons (process-get server 'mew-oauth2-code) sent))
+      (mew-oauth2-cleanup-redirect-handler port))))
 
 (ert-deftest mew-test-oauth2-state ()
   "An authorization code without our state must be refused.
 The redirect handler listens on localhost, so a page in the browser
 could otherwise make Mew redeem a code of the attacker's choosing."
-  (let ((mew-oauth2-state "st4te"))
-    (should (equal (mew-test-oauth2-redirect
-                    "GET /?code=good&state=st4te HTTP/1.1\r\n")
-                   '("good" . "HTTP/1.1 200 OK")))
-    (should (equal (mew-test-oauth2-redirect
-                    "GET /?code=evil&state=other HTTP/1.1\r\n")
-                   '(nil . "HTTP/1.1 400 Bad Request")))
-    (should (equal (mew-test-oauth2-redirect
-                    "GET /?code=evil HTTP/1.1\r\n")
-                   '(nil . "HTTP/1.1 400 Bad Request")))
-    ;; Something which is not the redirect is left alone.
-    (should (equal (mew-test-oauth2-redirect "GET /favicon.ico HTTP/1.1\r\n")
-                   '(nil . nil))))
+  (should (equal (mew-test-oauth2-redirect
+                  "st4te" "GET /?code=good&state=st4te HTTP/1.1\r\n")
+                 '("good" . "HTTP/1.1 200 OK")))
+  (should (equal (mew-test-oauth2-redirect
+                  "st4te" "GET /?code=evil&state=other HTTP/1.1\r\n")
+                 '(nil . "HTTP/1.1 400 Bad Request")))
+  (should (equal (mew-test-oauth2-redirect
+                  "st4te" "GET /?code=evil HTTP/1.1\r\n")
+                 '(nil . "HTTP/1.1 400 Bad Request")))
+  ;; Something which is not the redirect is left alone.
+  (should (equal (mew-test-oauth2-redirect
+                  "st4te" "GET /favicon.ico HTTP/1.1\r\n")
+                 '(nil . nil)))
   ;; No state of our own means we are not waiting for anything.
-  (let ((mew-oauth2-state nil))
-    (should (equal (mew-test-oauth2-redirect
-                    "GET /?code=evil&state=other HTTP/1.1\r\n")
-                   '(nil . "HTTP/1.1 400 Bad Request")))))
+  (should (equal (mew-test-oauth2-redirect
+                  nil "GET /?code=evil&state=other HTTP/1.1\r\n")
+                 '(nil . "HTTP/1.1 400 Bad Request"))))
 
 (ert-deftest mew-test-oauth2-random-string ()
   (let ((str (mew-random-binary-string 32)))
@@ -747,17 +772,6 @@ A client secret with \"+\" or \"&\" in it used to arrive mangled."
                    (url-hexify-string (url-unhex-string raw))))))
 
 
-(ert-deftest mew-test-xoauth2-json-status ()
-  "The status may be a number, and it may not be there at all.
-Both used to signal wrong-type-argument."
-  (let ((status (lambda (s) (mew-xoauth2-json-status (base64-encode-string s t)))))
-    (should (equal (funcall status "{\"status\":\"200\"}") "OK"))
-    (should (equal (funcall status "{\"status\":\"400\"}") "NO"))
-    (should (equal (funcall status "{\"status\":200}") "OK"))
-    (should (equal (funcall status "{\"status\":400}") "NO"))
-    (should (equal (funcall status "{\"other\":1}") "OK"))
-    (should (equal (funcall status "not json") "OK"))))
-
 (ert-deftest mew-test-oauth2-auth-code-cleanup ()
   "The listening socket has to go even when the user gives up.
 Otherwise the port stays taken for the rest of the session."
@@ -770,8 +784,56 @@ Otherwise the port stays taken for the rest of the session."
                       "https://example.org/auth" "id" "scope"
                       "http://localhost:8080" "challenge" 8080)
                      ""))
-      ;; once before setting up, once on the way out
-      (should (= cleanups 2)))))
+      (should (= cleanups 1)))))
+
+(defun mew-test-oauth2-answer (port code)
+  "Hand CODE to the authorization waiting on PORT, as the browser would."
+  (process-put (get-process (mew-oauth2-redirect-handler-name port))
+               'mew-oauth2-code code))
+
+(ert-deftest mew-test-oauth2-nested-auth-code ()
+  "An authorization started while waiting for the browser is refused
+when it needs the same port.  It used to overwrite the state and the
+handler of the first one."
+  (let ((port (mew-test-free-port))
+        (inner 'not-called))
+    (cl-letf (((symbol-function 'message) #'ignore)
+              ((symbol-function 'browse-url)
+               (lambda (&rest _)
+                 ;; e.g. a biff timer while the user is in the browser
+                 (setq inner (mew-oauth2-get-auth-code
+                              "https://example.org/auth" "id" "scope"
+                              "http://localhost" "challenge" port))
+                 (mew-test-oauth2-answer port "outer-code"))))
+      (should (equal (mew-oauth2-get-auth-code
+                      "https://example.org/auth" "id" "scope"
+                      "http://localhost" "challenge" port)
+                     "outer-code"))
+      (should (equal inner ""))
+      (should-not (process-status (mew-oauth2-redirect-handler-name port))))))
+
+(ert-deftest mew-test-oauth2-nested-auth-code-other-port ()
+  "Authorizations on different ports do not share their state or code."
+  (let* ((ports (mew-test-free-ports 2))
+         (outer (nth 0 ports))
+         (inner (nth 1 ports))
+         (inner-code 'not-called)
+         (depth 0))
+    (cl-letf (((symbol-function 'browse-url)
+               (lambda (&rest _)
+                 (setq depth (1+ depth))
+                 (if (= depth 1)
+                     (progn
+                       (setq inner-code (mew-oauth2-get-auth-code
+                                         "https://example.org/auth" "id" "scope"
+                                         "http://localhost" "challenge" inner))
+                       (mew-test-oauth2-answer outer "outer-code"))
+                   (mew-test-oauth2-answer inner "inner-code")))))
+      (should (equal (mew-oauth2-get-auth-code
+                      "https://example.org/auth" "id" "scope"
+                      "http://localhost" "challenge" outer)
+                     "outer-code"))
+      (should (equal inner-code "inner-code")))))
 
 (ert-deftest mew-test-oauth2-post-without-curl ()
   "A missing curl must give nil, not an error."
@@ -785,7 +847,8 @@ Otherwise the port stays taken for the rest of the session."
 (ert-deftest mew-test-xoauth2-refresh-refused ()
   "A refused refresh token must lead to a new authorization.
 Going on without one made Mew send the literal \"Bearer nil\"."
-  (let ((token (make-hash-table))
+  (let ((mew-oauth2-client-id "client")
+        (token (make-hash-table))
         (authorized nil))
     (puthash :refresh_token "old-refresh" token)
     (cl-letf (((symbol-function 'mew-oauth2-refresh-access-token)
@@ -803,7 +866,8 @@ Going on without one made Mew send the literal \"Bearer nil\"."
 
 (ert-deftest mew-test-xoauth2-refresh-kept ()
   "A refresh which answers without a new refresh token keeps the old one."
-  (let ((token (make-hash-table)))
+  (let ((mew-oauth2-client-id "client")
+        (token (make-hash-table)))
     (puthash :refresh_token "old-refresh" token)
     (cl-letf (((symbol-function 'mew-oauth2-refresh-access-token)
                (lambda (&rest _)
@@ -816,6 +880,32 @@ Going on without one made Mew send the literal \"Bearer nil\"."
       (should (equal (gethash :refresh_token token) "old-refresh"))
       (should (equal (gethash :access_token token) "fresh-access")))))
 
+(ert-deftest mew-test-xoauth2-without-client-id ()
+  "Without a client id, neither the browser nor the server is asked."
+  (let ((mew-oauth2-client-id nil)
+        (token (make-hash-table))
+        (asked nil))
+    (puthash :refresh_token "old-refresh" token)
+    (cl-letf (((symbol-function 'mew-oauth2-post)
+               (lambda (&rest _) (setq asked t) nil))
+              ;; Answer at once, or a regression would wait forever.
+              ((symbol-function 'browse-url)
+               (lambda (&rest _) (setq asked t) (signal 'quit nil)))
+              ((symbol-function 'message) #'ignore))
+      (should-not (mew-xoauth2-get-access-token token nil))
+      (should-not asked)
+      (should (equal (gethash :refresh_token token) "old-refresh")))))
+
+(ert-deftest mew-test-xoauth2-expires-in-string ()
+  "expires_in given as a string is taken as seconds."
+  (let ((token (make-hash-table))
+        (json (make-hash-table :test 'equal)))
+    (puthash "access_token" "access" json)
+    (puthash "expires_in" "3599" json)
+    (should (equal (mew-xoauth2-store token json) "access"))
+    (should (time-less-p (time-add 3000 nil) (gethash :expire token)))
+    (should (time-less-p (gethash :expire token) (time-add 3600 nil)))))
+
 (ert-deftest mew-test-xoauth2-auth-string-without-token ()
   "Without an access token nothing resembling one may be sent."
   (cl-letf (((symbol-function 'mew-passwd-setup-master) #'ignore)
@@ -827,6 +917,97 @@ Going on without one made Mew send the literal \"Bearer nil\"."
     (let ((s (mew-xoauth2-auth-string "me@example.org" "tag" nil)))
       (should (equal s ""))
       (should-not (string-match "nil" (base64-decode-string (concat s "")))))))
+
+(ert-deftest mew-test-xoauth2-save-only-new-token ()
+  "The password file is saved only when a new token was obtained."
+  (let ((mew-passwd-master t)
+        (mew-oauth2-client-id "client")
+        (token (make-hash-table))
+        (saves 0))
+    (puthash :access_token "access" token)
+    (puthash :expire (time-add 3600 nil) token)
+    (cl-letf (((symbol-function 'mew-passwd-setup-master) #'ignore)
+              ((symbol-function 'mew-passwd-get-passwd) (lambda (&rest _) token))
+              ((symbol-function 'mew-passwd-set-passwd) #'ignore)
+              ((symbol-function 'mew-passwd-set-counter) #'ignore)
+              ((symbol-function 'mew-passwd-save)
+               (lambda () (setq saves (1+ saves)))))
+      (mew-xoauth2-auth-string "me@example.org" "tag" nil)
+      (should (= saves 0))
+      (remhash :access_token token)
+      (cl-letf (((symbol-function 'mew-xoauth2-refresh)
+                 (lambda (tk _case)
+                   (mew-xoauth2-store
+                    tk (let ((h (make-hash-table :test 'equal)))
+                         (puthash "access_token" "new" h)
+                         (puthash "expires_in" 3600 h)
+                         h)))))
+        (mew-xoauth2-auth-string "me@example.org" "tag" nil))
+      (should (= saves 1)))))
+
+(ert-deftest mew-test-pop-xoauth2-error-challenge ()
+  "After the XOAUTH2 token, \"+ \" is an error, not +OK.
+An empty response is sent, and the -ERR which follows is a wrong token."
+  (let* ((buf (generate-new-buffer " *mew-test-pop*"))
+         (pro (make-pipe-process :name "mew-pop-info-test" :buffer buf
+                                 :noquery t))
+         (pnm (process-name pro))
+         (sent nil)
+         (called nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'mew-pop-process-send-string)
+                   (lambda (_pro &rest args)
+                     (setq sent (cons (apply #'format args) sent))))
+                  ((symbol-function 'mew-pop-command-wpwd)
+                   (lambda (&rest _) (setq called 'wpwd)))
+                  ((symbol-function 'mew-pop-command-list)
+                   (lambda (&rest _) (setq called 'list))))
+          (mew-pop-set-status pnm "token-xoauth2")
+          (mew-pop-filter pro "+ eyJzdGF0dXMiOiI0MDAifQ==\r\n")
+          (should (equal (mew-pop-get-status pnm) "xoauth2-error"))
+          (should (equal sent '("")))
+          (mew-pop-filter pro "-ERR [AUTH] Invalid credentials\r\n")
+          (should (eq called 'wpwd))
+          ;; Success is still success.
+          (mew-pop-set-status pnm "token-xoauth2")
+          (mew-pop-filter pro "+OK Welcome\r\n")
+          (should (eq called 'list)))
+      (delete-process pro)
+      (kill-buffer buf)
+      (makunbound (intern pnm)))))
+
+(ert-deftest mew-test-xoauth2-authorize-canceled ()
+  "Without an authorization code no token may be requested."
+  (let ((posted nil)
+        (token (make-hash-table)))
+    (cl-letf (((symbol-function 'mew-oauth2-get-auth-code) (lambda (&rest _) ""))
+              ((symbol-function 'mew-oauth2-get-access-token)
+               (lambda (&rest _) (setq posted t) nil))
+              ((symbol-function 'message) #'ignore))
+      (should-not (mew-xoauth2-authorize token nil))
+      (should-not posted))))
+
+(ert-deftest mew-test-passwd-forget-token ()
+  "A refused access token is forgotten, but its refresh token is kept
+unless the access token was just obtained."
+  (let ((mew-passwd-alist nil)
+        (token (make-hash-table)))
+    (cl-letf (((symbol-function 'mew-passwd-use-auth-source-p) #'ignore))
+      (puthash :access_token "old-access" token)
+      (puthash :refresh_token "refresh" token)
+      (puthash :expire (time-add 3600 nil) token)
+      (mew-passwd-set-passwd "tag" token)
+      (mew-passwd-forget-passwd "tag")
+      (let ((kept (mew-passwd-get-passwd "tag")))
+        (should (equal (gethash :refresh_token kept) "refresh"))
+        (should-not (gethash :access_token kept)))
+      (puthash :fresh t token)
+      (mew-passwd-set-passwd "tag" token)
+      (mew-passwd-forget-passwd "tag")
+      (should-not (mew-passwd-get-passwd "tag"))
+      (mew-passwd-set-passwd "tag" "secret")
+      (mew-passwd-forget-passwd "tag")
+      (should-not (mew-passwd-get-passwd "tag")))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -1037,6 +1218,59 @@ In a batch run epa is not loaded, so this test tells the two apart."
       (mew-passwd-auth-source-get-passwd "user@host:993"))
     (should (eq seen 'loopback))))
 
+(ert-deftest mew-test-passwd-rendezvous-own-process ()
+  "Waiting for gpg ends only when that gpg is done.
+Another gpg finishing meanwhile used to end the wait too early."
+  (let ((pro (make-process :name "mew-test-gpg" :command '("sleep" "0.5")
+                           :sentinel #'mew-passwd-sentinel :noquery t))
+        (other (make-pipe-process :name "mew-test-other-gpg" :noquery t)))
+    (unwind-protect
+        (progn
+          ;; e.g. gpg of a nested load exits while we are waiting
+          (run-at-time 0.05 nil #'mew-passwd-sentinel other "finished\n")
+          (mew-passwd-rendezvous pro)
+          (should-not (process-live-p pro)))
+      (delete-process other)
+      (when (process-live-p pro) (delete-process pro)))))
+
+(ert-deftest mew-test-passwd-nested-load ()
+  "A password asked for while the password file is loaded does not
+start another load nor use the minibuffer, which is in use."
+  (let* ((dir (make-temp-file "mew-test-conf" t))
+         (mew-conf-path dir)
+         (mew-passwd-file "mew-passwd-test")
+         (mew-use-master-passwd t)
+         (mew-use-cached-passwd nil)
+         (mew-master-passwd-type 'master)
+         (mew-passwd-master nil)
+         (mew-passwd-alist nil)
+         (loads 0)
+         (asked nil)
+         (inner 'not-called))
+    (unwind-protect
+        (progn
+          (write-region "" nil (expand-file-name mew-passwd-file dir) nil 'no-msg)
+          (cl-letf (((symbol-function 'mew-passwd-check-agent-hack) #'ignore)
+                    ((symbol-function 'mew-timing) #'ignore)
+                    ((symbol-function 'mew-passwd-save) #'ignore)
+                    ((symbol-function 'message) #'ignore)
+                    ((symbol-function 'mew-read-passwd)
+                     (lambda (&rest _) (setq asked t) "typed"))
+                    ((symbol-function 'mew-passwd-load)
+                     (lambda ()
+                       (setq loads (1+ loads))
+                       ;; another connection while the master password is read
+                       (when (= loads 1)
+                         (setq inner (mew-input-passwd "Password: " "other")))
+                       (setq mew-passwd-master t)
+                       (list (list "key" "secret" 0)))))
+            (should (equal (mew-input-passwd "Password: " "key") "secret"))
+            (should (= loads 1))
+            (should (equal inner ""))
+            (should-not asked)))
+      (remove-hook 'kill-emacs-hook 'mew-passwd-clean-up)
+      (delete-directory dir t))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
 ;;; mew-pick.el
@@ -1099,6 +1333,54 @@ file is compiled with lexical binding."
 					    (number-sequence 1 23)))
 		 '("1:23"))))
 
+(defun mew-test-imap-xoauth2 (imap2 capability)
+  "Authenticate with XOAUTH2 after CAPABILITY through the filter.
+Use mew-imap2 if IMAP2.  Return the sent lines in order."
+  (let* ((p (if imap2 "mew-imap2-" "mew-imap-"))
+         (fn (lambda (name) (intern (concat p name))))
+         (buf (generate-new-buffer " *mew-test-imap*"))
+         (pro (make-pipe-process :name (concat p "info-test") :buffer buf
+                                 :noquery t))
+         (pnm (process-name pro))
+         (sent nil))
+    (unwind-protect
+        (cl-letf (((symbol-function (funcall fn "process-send-string"))
+                   (lambda (_pro _pnm &rest args)
+                     (funcall (funcall fn "set-tag") pnm "a1")
+                     (setq sent (cons (apply #'format args) sent))))
+                  ((symbol-function (funcall fn "process-send-string2"))
+                   (lambda (_pro &rest args)
+                     (setq sent (cons (apply #'format args) sent))))
+                  ((symbol-function 'mew-xoauth2-auth-string)
+                   (lambda (&rest _) "TOKEN"))
+                  ((symbol-function (funcall fn "command-next"))
+                   (lambda (&rest _) (setq sent (cons 'next sent)))))
+          (mew-info-clean-up pnm)
+          (funcall (funcall fn "set-auth") pnm t)
+          (if (fboundp (funcall fn "set-secure"))
+              (funcall (funcall fn "set-secure") pnm t))
+          (funcall (funcall fn "set-auth-list") pnm '("XOAUTH2"))
+          (funcall (funcall fn "set-status") pnm "capability")
+          (funcall (funcall fn "set-tag") pnm "a0")
+          (funcall (funcall fn "filter") pro
+                   (format "* CAPABILITY IMAP4rev1 %s AUTH=XOAUTH2\r\na0 OK done\r\n"
+                           capability))
+          (when (equal (funcall (funcall fn "get-status") pnm) "xoauth2")
+            (funcall (funcall fn "filter") pro "+ \r\n"))
+          (should (equal (funcall (funcall fn "get-status") pnm) "auth-xoauth2"))
+          (funcall (funcall fn "filter") pro "a1 OK Success\r\n")
+          (nreverse sent))
+      (delete-process pro)
+      (kill-buffer buf))))
+
+(ert-deftest mew-test-imap-xoauth2-sasl-ir ()
+  "The token goes with AUTHENTICATE only if the server has SASL-IR."
+  (dolist (imap2 '(nil t))
+    (should (equal (mew-test-imap-xoauth2 imap2 "SASL-IR")
+                   '("AUTHENTICATE XOAUTH2 TOKEN" next)))
+    (should (equal (mew-test-imap-xoauth2 imap2 "")
+                   '("AUTHENTICATE XOAUTH2" "TOKEN" next)))))
+
 (ert-deftest mew-test-imap-mailbox-arrange ()
   "A mailbox with children gets the separator appended."
   (let ((lst (list (list "inbox") (list "inbox/sub")
@@ -1111,6 +1393,43 @@ file is compiled with lexical binding."
   (should (equal (mew-serv-to-port "imaps") 993))
   (should (equal (mew-serv-to-port "587") 587))
   (should (equal (mew-serv-to-port 25) 25)))
+
+(defun mew-test-sentinel-flush (proto)
+  "Run the sentinel of PROTO for a connection of case \"work\" while
+another case is current, and return the case whose queue is flushed."
+  (let* ((pnm (format "mew-%s-info-test" proto))
+         (pro (make-pipe-process :name pnm :noquery t))
+         (bnm "*mew-test-sentinel*")
+         (mew-case "home")
+         (mew-auto-flush-queue t)
+         (flushed 'not-flushed))
+    (unwind-protect
+        (progn
+          (get-buffer-create bnm)
+          (mew-info-clean-up pnm)
+          (funcall (intern (format "mew-%s-set-case" proto)) pnm "work")
+          (funcall (intern (format "mew-%s-set-bnm" proto)) pnm bnm)
+          (funcall (intern (format "mew-%s-set-flush" proto)) pnm t)
+          (funcall (intern (format "mew-%s-set-done" proto)) pnm t)
+          (funcall (intern (format "mew-%s-set-error" proto)) pnm "error")
+          (cl-letf (((symbol-function 'mew-smtp-flush-queue)
+                     (lambda (case &rest _) (setq flushed case)))
+                    ((symbol-function 'mew-summary-mark-recover) #'ignore)
+                    ((symbol-function 'mew-summary-unlock) #'ignore)
+                    ((symbol-function 'mew-net-disp-info-display) #'ignore)
+                    ((symbol-function 'mew-net-status-clear) #'ignore)
+                    ((symbol-function 'mew-expand-file) #'ignore))
+            (funcall (intern (format "mew-%s-sentinel" proto)) pro "finished\n"))
+          flushed)
+      (delete-process pro)
+      (mew-info-clean-up pnm)
+      (kill-buffer bnm))))
+
+(ert-deftest mew-test-sentinel-flush-case ()
+  "The queue flushed after receiving is the one of the receiving case,
+not of the case which happens to be current then."
+  (should (equal (mew-test-sentinel-flush "pop") "work"))
+  (should (equal (mew-test-sentinel-flush "imap") "work")))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -1161,25 +1480,134 @@ compatibility code of mew-env.el belongs here."
 ;;; mew-gnutls.el
 ;;;
 
-(ert-deftest mew-test-gnutls-capability-command ()
-  "The forms in mew-gnutls-plist are evaluated and refer to CASE.
-CASE used to be picked up from the dynamic binding of the caller's
-argument, which stops working under lexical binding."
-  (let ((cmd (plist-get (mew-gnutls-parameters 'smtp t "default")
-		        :capability-command)))
-    (should (stringp cmd))
-    (should (string-match "\\`EHLO .+\n\\'" cmd)))
-  (should (equal (plist-get (mew-gnutls-parameters 'imap t "default")
-			    :capability-command)
-		 "1 CAPABILITY\n"))
-  (should (functionp (plist-get (mew-gnutls-parameters 'smtp t "default")
-				:starttls-function))))
+(defun mew-test-gnutls-handshake (proto starttlsp greeting replies &optional nsm)
+  "Run `mew-gnutls-handshake' against a fake server.
+GREETING is in the buffer from the start for STARTTLS, or comes with
+TLS otherwise.  REPLIES maps a command regexp to its reply.  Return
+the result and the keyword arguments given to `gnutls-negotiate'.
+NSM replaces `nsm-verify-connection'."
+  (let* ((buf (generate-new-buffer " *mew-test-gnutls*"))
+         (pro (make-pipe-process :name "mew-test-gnutls" :buffer buf
+                                 :noquery t))
+         (reply (lambda (str)
+                  (with-current-buffer buf
+                    (goto-char (point-max))
+                    (insert str))))
+         negotiated)
+    (unwind-protect
+        (cl-letf (((symbol-function 'process-send-string)
+                   (lambda (_pro cmd)
+                     (dolist (r replies)
+                       (if (string-match (car r) cmd)
+                           (funcall reply (cdr r))))))
+                  ((symbol-function 'gnutls-negotiate)
+                   (lambda (&rest args)
+                     (setq negotiated args)
+                     (unless starttlsp (funcall reply greeting))))
+                  ((symbol-function 'nsm-verify-connection)
+                   (or nsm (lambda (pro &rest _) pro))))
+          (if starttlsp (funcall reply greeting))
+          (list (condition-case err
+                    (mew-gnutls-handshake pro "mail.example.org" 25
+                                          proto starttlsp "default")
+                  (error (error-message-string err)))
+                negotiated))
+      (delete-process pro)
+      (kill-buffer buf))))
 
-(ert-deftest mew-test-gnutls-no-starttls ()
-  (let ((params (mew-gnutls-parameters 'smtp nil "default")))
-    (should-not (plist-get params :capability-command))
-    (should-not (plist-get params :starttls-function))
-    (should-not (plist-get params :success))))
+(ert-deftest mew-test-gnutls-starttls-smtp ()
+  "Mew's TLS parameters are given to `gnutls-negotiate' for STARTTLS."
+  (let* ((mew-ssl-algorithm-priority "SECURE256")
+         (ret (mew-test-gnutls-handshake
+               'smtp t "220-mail\n220 ready\n"
+               '(("\\`EHLO " . "250-mail\n250-STARTTLS\n250 8BITMIME\n")
+                 ("\\`STARTTLS" . "220 go ahead\n")))))
+    (should (equal (car ret) "220-mail\n220 ready\n"))
+    (should (equal (plist-get (nth 1 ret) :priority-string) "SECURE256"))
+    (should (equal (plist-get (nth 1 ret) :hostname) "mail.example.org"))))
+
+(ert-deftest mew-test-gnutls-starttls-not-supported ()
+  "Without STARTTLS, TLS is not negotiated."
+  (let ((ret (mew-test-gnutls-handshake
+              'smtp t "220 ready\n"
+              '(("\\`EHLO " . "250-mail\n250 8BITMIME\n")))))
+    (should (equal (car ret) "Server does not support STARTTLS"))
+    (should-not (nth 1 ret))))
+
+(ert-deftest mew-test-gnutls-starttls-imap ()
+  "IMAP replies end with the tagged line, not with the first line."
+  (let ((ret (mew-test-gnutls-handshake
+              'imap t "* OK ready\n"
+              '(("\\`1 CAPABILITY" . "* CAPABILITY IMAP4rev1 STARTTLS\n1 OK done\n")
+                ("\\`2 STARTTLS" . "2 OK begin\n")))))
+    (should (equal (car ret) "* OK ready\n"))
+    (should (nth 1 ret)))
+  (let ((ret (mew-test-gnutls-handshake
+              'imap t "* OK ready\n"
+              '(("\\`1 CAPABILITY" . "* CAPABILITY IMAP4rev1 STARTTLS\n1 OK done\n")
+                ("\\`2 STARTTLS" . "2 BAD no\n")))))
+    (should (equal (car ret) "Server refused STARTTLS"))
+    (should-not (nth 1 ret))))
+
+(ert-deftest mew-test-gnutls-nntp-no-capabilities ()
+  "An error reply to CAPABILITIES does not wait for the timeout."
+  (let ((ret (mew-test-gnutls-handshake
+              'nntp t "200 ready\n"
+              '(("\\`CAPABILITIES" . "500 what?\n")))))
+    (should (equal (car ret) "Server does not support STARTTLS"))))
+
+(ert-deftest mew-test-gnutls-tls-greeting ()
+  "With TLS, the greeting is read after the handshake."
+  (let ((ret (mew-test-gnutls-handshake 'pop nil "+OK ready\n" nil)))
+    (should (equal (car ret) "+OK ready\n"))
+    (should (nth 1 ret))))
+
+(ert-deftest mew-test-gnutls-verify-level-0 ()
+  "Level 0 skips NSM for this connection only."
+  (let ((mew-ssl-verify-level 0)
+        (nsm nil))
+    (should (equal (car (mew-test-gnutls-handshake
+                         'pop nil "+OK ready\n" nil
+                         (lambda (&rest _) (setq nsm t) nil)))
+                   "+OK ready\n"))
+    (should-not nsm))
+  (let ((mew-ssl-verify-level 1))
+    (should (equal (car (mew-test-gnutls-handshake
+                         'pop nil "+OK ready\n" nil #'ignore))
+                   "Server certificate is not accepted"))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; mew-stunnel.el
+;;;
+
+(ert-deftest mew-test-stunnel-reuse-key ()
+  "A tunnel is not reused for other options, nor for a similar server."
+  (let* ((mew-ssl-verify-level 1)
+         (key1 (mew-stunnel-key nil nil))
+         (key2 (let ((mew-ssl-verify-level 0)) (mew-stunnel-key nil nil)))
+         (key3 (mew-stunnel-key nil "pop3"))
+         (name (mew-stunnel-info-name "mail.example.org" 995 key1 8001))
+         (regex (mew-stunnel-info-name-regex "mail.example.org" 995 key1)))
+    (should-not (equal key1 key2))
+    (should-not (equal key1 key3))
+    (should (equal key1 (mew-stunnel-key nil nil)))
+    (should (string-match regex name))
+    (should (equal (mew-ssl-pnm-to-lport name) "8001"))
+    (should-not (string-match regex (mew-stunnel-info-name "mailxexample.org" 995 key1 8001)))
+    (should-not (string-match regex (mew-stunnel-info-name "mail.example.org" 9950 key1 8001)))
+    (should-not (string-match regex (mew-stunnel-info-name "mail.example.org" 995 key2 8001)))))
+
+(ert-deftest mew-test-stunnel-failed-to-initialize ()
+  "\"Failed to initialize TLS\" is a failure, not a success."
+  (let* ((pro (make-pipe-process :name "mew-stunnel-info-test" :noquery t))
+         (pnm (process-name pro)))
+    (unwind-protect
+        (progn
+          (mew-info-clean-up pnm)
+          (mew-stunnel-filter2 pro "LOG3[0]: Failed to initialize TLS\n")
+          (should (eq (mew-stunnel-get-status pnm) 'tls-failure)))
+      (delete-process pro))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
